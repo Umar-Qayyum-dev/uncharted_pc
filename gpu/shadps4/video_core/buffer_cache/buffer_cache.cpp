@@ -536,30 +536,46 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 }
 
 u64 BufferCache::WriteBackGpuData(VAddr addr, u64 size, const u8* data) {
+    std::vector<WritePart> parts;
+    for (const auto& [start, end] : GpuWrittenParts(addr, size)) {
+        parts.push_back({start, data + (start - addr), end - start});
+    }
+    return WriteBackParts(parts);
+}
+
+std::vector<std::pair<VAddr, VAddr>> BufferCache::GpuWrittenParts(VAddr addr, u64 size) const {
+    std::vector<std::pair<VAddr, VAddr>> parts;
+    gpu_modified_ranges.ForEachInRange(addr, size,
+                                       [&](VAddr start, VAddr end) { parts.emplace_back(start, end); });
+    return parts;
+}
+
+u64 BufferCache::WriteBackParts(std::span<const WritePart> parts) {
     std::scoped_lock lk{shadow_mutex};
     u64 written = 0;
-    gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
-        memory->TryWriteBacking(reinterpret_cast<void*>(start), data + (start - addr), end - start);
-        written += end - start;
+    for (const auto& part : parts) {
+        memory->TryWriteBacking(reinterpret_cast<void*>(part.addr), part.data, part.size);
+        written += part.size;
         if (shadow_pages.load(std::memory_order_relaxed) == 0) {
-            return;
+            continue;
         }
-        for (VAddr page = Common::AlignDown(start, TRACKER_BYTES_PER_PAGE); page < end;
+        const VAddr end = part.addr + part.size;
+        for (VAddr page = Common::AlignDown(part.addr, TRACKER_BYTES_PER_PAGE); page < end;
              page += TRACKER_BYTES_PER_PAGE) {
             const auto it = shadows.find(page);
             if (it == shadows.end()) {
                 continue;
             }
             for (auto& shadow : it->second) {
-                const VAddr from = std::max(start, shadow.start);
+                const VAddr from = std::max(part.addr, shadow.start);
                 const VAddr to = std::min<VAddr>(end, shadow.start + shadow.bytes.size());
                 if (from < to) {
-                    std::memcpy(shadow.bytes.data() + (from - shadow.start), data + (from - addr),
-                                to - from);
+                    std::memcpy(shadow.bytes.data() + (from - shadow.start),
+                                part.data + (from - part.addr), to - from);
                 }
             }
         }
-    });
+    }
     return written;
 }
 

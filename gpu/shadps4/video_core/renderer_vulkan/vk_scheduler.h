@@ -891,6 +891,16 @@ public:
         num_pending_ops.fetch_add(1, std::memory_order_release);
     }
 
+    /// bbport: runs `signal` (a guest fence) on the pending-ops thread once the GPU has
+    /// completed the work recorded so far (submitted now), after the signals deferred before
+    /// it; writes the guest sees later wait for it (WaitDeferredSignals).
+    void SignalAfterGpu(Common::UniqueFunction<void>&& signal);
+
+    /// Signals SignalAfterGpu took that have not run yet.
+    [[nodiscard]] bool GpuSignalsPending() const noexcept {
+        return gpu_signals_done->load(std::memory_order_acquire) < gpu_signals_issued;
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
@@ -951,6 +961,8 @@ private:
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
+    u64 gpu_signals_issued = 0;
+    std::shared_ptr<std::atomic<u64>> gpu_signals_done = std::make_shared<std::atomic<u64>>(0);
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()

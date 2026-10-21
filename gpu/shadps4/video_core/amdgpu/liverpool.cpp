@@ -287,7 +287,6 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
-    Vulkan::BeforeGuestFence(rasterizer);
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     // bbport diagnosis: BB_READBACK_RANGE=<hex address>:<hex size>: GPU data there is copied back
@@ -314,6 +313,11 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
+    // Scalar copy read backs (vk_shader_hle.cpp) go into guest memory before the fence.
+    Common::UniqueFunction<void> signal{[eop] { SignalEop(eop); }};
+    if (Vulkan::DeferGuestFence(rasterizer, signal)) {
+        return;
+    }
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {

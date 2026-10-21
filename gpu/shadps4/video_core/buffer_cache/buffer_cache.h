@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <unordered_map>
+#include <span>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -126,6 +127,18 @@ public:
     /// merge does not take them for the guest's.
     /// Returns the bytes written.
     u64 WriteBackGpuData(VAddr addr, u64 size, const u8* data);
+
+    /// bbport: the byte ranges [start, end) of a range that hold GPU data.
+    [[nodiscard]] std::vector<std::pair<VAddr, VAddr>> GpuWrittenParts(VAddr addr, u64 size) const;
+
+    /// bbport: WriteBackGpuData for ranges already known to be GPU data; any thread (shadows
+    /// under their lock). Returns the bytes written.
+    struct WritePart {
+        VAddr addr;
+        const u8* data;
+        u64 size;
+    };
+    u64 WriteBackParts(std::span<const WritePart> parts);
 
     /// bbport: the range as the GPU sees it into `out` (GPU-written bytes from the GPU's copy,
     /// waiting for the whole queue; the rest from guest memory). Guest memory and the cache's

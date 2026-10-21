@@ -254,6 +254,22 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     KickRecording(true);
 }
 
+void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal) {
+    const u64 earlier = deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    ++gpu_signals_issued;
+    DeferPriorityOperation([signal = std::move(signal), earlier, done = deferred_signals_done,
+                            gpu_done = gpu_signals_done]() mutable {
+        // Fences are seen in order: the ones deferred before (to the recording thread) first.
+        while (done->load(std::memory_order_acquire) < earlier) {
+            std::this_thread::yield();
+        }
+        signal();
+        gpu_done->fetch_add(1, std::memory_order_release);
+        done->fetch_add(1, std::memory_order_release);
+    });
+    Flush();
+}
+
 void Scheduler::WaitDeferredSignals() {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||

@@ -68,7 +68,6 @@ enum : std::uint64_t {
     // On by default (bit set: off): history of a thin feature this jitter phase missed is kept
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
-    RecorderFlips = 1ull << 56, ///< the guest's flip interrupt goes behind deferred fences, no wait
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     ComputePipeline = 1ull << 58, ///< compute queue packets without a drain each (liverpool.cpp)
     RecorderEosFences = 1ull << 59, ///< end-of-shader fences signalled on the recording thread

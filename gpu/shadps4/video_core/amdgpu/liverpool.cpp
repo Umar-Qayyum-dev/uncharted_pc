@@ -420,19 +420,6 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
-    // bbport: the flip interrupt follows the fences before it. On the draw recording thread it
-    // goes behind those deferred to the Vulkan recording thread instead of that thread waiting
-    // for them (U2's museum: ~10 ms a frame behind a fence held until the GPU is done; on the
-    // PS4 a flip also comes once the GPU is done). Toggle bit RecorderFlips: wait as before.
-    if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences) &&
-        !BbToggle::Disabled(BbToggle::RecorderFlips)) {
-        rasterizer.OnGuestFlip();
-        rasterizer.GetBufferCache().CheckStableBindings();
-        rasterizer.CheckConstants();
-        rasterizer.SignalAfterHostCopies(
-            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
-        return;
-    }
     rasterizer.WaitDeferredSignals();
     rasterizer.OnGuestFlip();
     rasterizer.GetBufferCache().CheckStableBindings();

@@ -331,6 +331,9 @@ public:
             in_flight.push_back(std::move(entry));
         }
         queued.clear();
+        // Submitted now, the copies have usually completed by the next fence, which then needs
+        // not wait for the GPU (the work recorded up to it).
+        runtime.GetScheduler().Flush();
     }
 
     /// Copies whose GPU work has completed, into guest memory (none handed to a fence before).
@@ -389,6 +392,13 @@ public:
             }
         }
         if (handoff->entries.empty() && !scheduler.GpuSignalsPending()) {
+            return false;
+        }
+        if (!scheduler.GpuSignalsPending() && scheduler.IsFree(handoff->tick)) {
+            // Completed already: written back here, and the fence goes as usual.
+            Finish(*handoff, buffer_cache);
+            std::scoped_lock lk{mutex};
+            ++completed_fences;
             return false;
         }
         if (Mode() == 4) {
@@ -533,8 +543,8 @@ private:
         }
         std::printf("Scalar copy read backs: %llu into guest memory 0/1/2/3+ frames after the "
                     "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full); %llu bytes written; "
-                    "%llu fences signalled after the GPU (%llu only to stay in order), %llu waits "
-                    "at fences",
+                    "%llu fences signalled after the GPU (%llu only to stay in order), %llu with "
+                    "the copies completed, %llu waits at fences",
                     static_cast<unsigned long long>(ages[0] + ages[1] + ages[2] + ages[3]),
                     static_cast<unsigned long long>(ages[0]), static_cast<unsigned long long>(ages[1]),
                     static_cast<unsigned long long>(ages[2]), static_cast<unsigned long long>(ages[3]),
@@ -542,6 +552,7 @@ private:
                     static_cast<unsigned long long>(written_bytes),
                     static_cast<unsigned long long>(deferred_fences),
                     static_cast<unsigned long long>(ordered_fences),
+                    static_cast<unsigned long long>(completed_fences),
                     static_cast<unsigned long long>(fence_waits));
         if (Mode() == 2) {
             std::printf("; NPC verify: %llu compared with the slow read back, %llu mismatches",
@@ -551,7 +562,7 @@ private:
         std::printf("\n");
         ages = {};
         skipped = checked = differed = written_bytes = deferred_fences = fence_waits = 0;
-        ordered_fences = 0;
+        ordered_fences = completed_fences = 0;
         window = now;
     }
 
@@ -563,7 +574,7 @@ private:
     std::deque<Entry> in_flight;
     std::array<u64, 4> ages{};
     u64 skipped = 0, checked = 0, differed = 0, written_bytes = 0;
-    u64 deferred_fences = 0, ordered_fences = 0, fence_waits = 0;
+    u64 deferred_fences = 0, ordered_fences = 0, completed_fences = 0, fence_waits = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 

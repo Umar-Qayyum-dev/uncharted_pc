@@ -430,6 +430,26 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+    const u32 num_bytes = (header->type3.count.Value() - 2) * sizeof(u32);
+    // bbport: a label (up to 8 bytes) goes behind the copies and fences deferred to the Vulkan
+    // recording thread instead of the draw recording thread waiting for them (U2's museum: one a
+    // frame, ~12 ms of waiting behind a fence held until the GPU is done). Larger writes may be
+    // data later draws read: they keep the wait. Toggle bit RecorderLabelWrites: as before.
+    if (num_bytes <= sizeof(u64) && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences) &&
+        !BbToggle::Disabled(BbToggle::RecorderLabelWrites)) {
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        u64 value = 0;
+        std::memcpy(&value, write_data->data, num_bytes);
+        auto* address = write_data->Address<u8*>();
+        rasterizer.SignalAfterHostCopies([address, value, num_bytes] {
+            BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes,
+                             BbWriteLog::WriteData);
+            std::memcpy(address, &value, num_bytes);
+        });
+        return;
+    }
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();

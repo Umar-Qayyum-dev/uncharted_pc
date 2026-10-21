@@ -27,6 +27,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 
 namespace AmdGpu {
 
@@ -286,6 +287,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
+    Vulkan::BeforeGuestFence(rasterizer);
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     // bbport diagnosis: BB_READBACK_RANGE=<hex address>:<hex size>: GPU data there is copied back

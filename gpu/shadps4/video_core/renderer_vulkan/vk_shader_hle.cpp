@@ -262,23 +262,42 @@ static constexpr u64 SCALAR_COPY64_SHADER_HASH = 0x6a6422a9;  // 64 dwords per w
 // kept data from long before, and NPCs were drawn floating, sunk or without legs while they stood
 // right (hard to hit). BB_SCALAR_COPY_SYNC=1 read the source back first, waiting for the GPU
 // (U2 museum: 27 -> 15 FPS). Instead, right behind the copy, the GPU also copies the destination
-// into a host-visible ring; once that work has completed, the bytes go into guest memory
-// (WriteBackGpuData: only bytes still GPU data). The game reads them a frame or two late, and
-// nothing waits. BB_SCALAR_COPY_READBACK=0: off; =verify: every 8th one is also read back the
-// slow way and compared (BB_FRAME_STATS=1 prints the counts every 5 s).
+// into a host-visible ring, and the bytes go into guest memory (WriteBackGpuData: only bytes
+// still GPU data) before the next end-of-pipe fence the guest sees, waiting for that work only
+// if it has not completed: the game reads them after that fence, as on the PS4 (a frame later
+// was too late: the NPCs stayed wrong). BB_SCALAR_COPY_READBACK=0: off; =late: no wait at the
+// fence (written back at the next copy once completed); =verify: as the default, and every 8th
+// one is also read back the slow way and compared (BB_FRAME_STATS=1 prints counts every 5 s).
 class ScalarCopyReadback {
 public:
     static constexpr u64 Capacity = 4_MB;
 
-    static int Mode() { // 0 off, 1 on, 2 verify
+    static int Mode() { // 0 off, 1 at fences, 2 verify (at fences), 3 late
         static const int mode = [] {
             const char* env = std::getenv("BB_SCALAR_COPY_READBACK");
             if (env && env[0] == '0') {
                 return 0;
             }
-            return env && std::strcmp(env, "verify") == 0 ? 2 : 1;
+            if (env && std::strcmp(env, "verify") == 0) {
+                return 2;
+            }
+            return env && std::strcmp(env, "late") == 0 ? 3 : 1;
         }();
         return mode;
+    }
+
+    /// Before an end-of-pipe fence the guest sees: the copies so far into guest memory.
+    void BeforeFence(Rasterizer& rasterizer) {
+        if (in_flight.empty() || Mode() == 3) {
+            return;
+        }
+        auto& scheduler = rasterizer.GetRuntime().GetScheduler();
+        const u64 tick = in_flight.back().tick;
+        if (!scheduler.IsFree(tick)) {
+            ++fence_waits;
+            scheduler.Wait(tick);
+        }
+        WriteBack(rasterizer);
     }
 
     /// A copy whose destination guest memory does not get; `truth`: its data (verify) or empty.
@@ -388,13 +407,14 @@ private:
         }
         std::printf("Scalar copy read backs: %llu into guest memory 0/1/2/3+ frames after the "
                     "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full); %llu changed guest memory, "
-                    "%llu bytes written, %llu had no GPU data left",
+                    "%llu bytes written, %llu had no GPU data left; %llu waits at fences",
                     static_cast<unsigned long long>(ages[0] + ages[1] + ages[2] + ages[3]),
                     static_cast<unsigned long long>(ages[0]), static_cast<unsigned long long>(ages[1]),
                     static_cast<unsigned long long>(ages[2]), static_cast<unsigned long long>(ages[3]),
                     static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(changed),
                     static_cast<unsigned long long>(written_bytes),
-                    static_cast<unsigned long long>(none_left));
+                    static_cast<unsigned long long>(none_left),
+                    static_cast<unsigned long long>(fence_waits));
         if (Mode() == 2) {
             std::printf("; NPC verify: %llu compared with the slow read back, %llu mismatches",
                         static_cast<unsigned long long>(checked),
@@ -402,7 +422,7 @@ private:
         }
         std::printf("\n");
         ages = {};
-        skipped = checked = differed = changed = written_bytes = none_left = 0;
+        skipped = checked = differed = changed = written_bytes = none_left = fence_waits = 0;
         window = now;
     }
 
@@ -412,6 +432,7 @@ private:
     std::deque<Entry> in_flight;
     std::array<u64, 4> ages{};
     u64 skipped = 0, checked = 0, differed = 0, changed = 0, written_bytes = 0, none_left = 0;
+    u64 fence_waits = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 
@@ -551,6 +572,12 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
     // Only the images overlapping the exact range: the uploads read guest memory here.
     rasterizer.GetTextureCache().InvalidateMemoryFromGPU(dst.base_address, size, true);
     return true;
+}
+
+void BeforeGuestFence(Rasterizer& rasterizer) {
+    if (ScalarCopyReadback::Mode()) {
+        Readback().BeforeFence(rasterizer);
+    }
 }
 
 void AfterGuestMemoryShaderDispatch(Rasterizer& rasterizer) {

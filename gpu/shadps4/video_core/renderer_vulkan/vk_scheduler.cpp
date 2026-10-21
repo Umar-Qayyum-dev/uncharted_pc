@@ -238,6 +238,31 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
 }
 
 void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
+    if (GpuSignalsPending()) {
+        // bbport: a fence signalled after the GPU (SignalAfterGpu) is pending: this one goes
+        // behind it, on its thread, once the copies before it are done (fences stay in order).
+        auto copies_done = std::make_shared<std::atomic<bool>>(false);
+        if (IsRecordingDeferred()) {
+            BbCopy::FlushBatch();
+            Record([copies_done](vk::CommandBuffer) {
+                BbCopy::AfterCopies(
+                    [copies_done] { copies_done->store(true, std::memory_order_release); });
+            });
+            KickRecording(true);
+        } else {
+            WaitHostCopies();
+            copies_done->store(true, std::memory_order_release);
+        }
+        SignalAfterGpu(
+            [copies_done, signal = std::move(signal)]() mutable {
+                while (!copies_done->load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                signal();
+            },
+            false);
+        return;
+    }
     if (!IsRecordingDeferred()) {
         WaitHostCopies();
         signal();

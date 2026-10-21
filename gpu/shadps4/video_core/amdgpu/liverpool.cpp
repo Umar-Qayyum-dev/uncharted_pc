@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <chrono>
 #include <pthread.h>
 #ifndef _WIN32
@@ -422,46 +419,18 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 }
 
-// bbport: delivers flip interrupts in order on a thread of its own. The guest's flip handlers run
-// inside Signal() and may wait for the GPU command thread, which may itself wait for the deferred
-// fence that signals the flip: delivered there, the game hung at its first flips.
-void PostFlipInterrupt() {
-    static std::mutex mutex;
-    static std::condition_variable_any cv;
-    static u64 posted = 0;
-    static std::jthread thread([](std::stop_token stop) {
-        Common::SetCurrentThreadName("bb:FlipIrq");
-        u64 delivered = 0;
-        while (!stop.stop_requested()) {
-            {
-                std::unique_lock lk{mutex};
-                if (!cv.wait(lk, stop, [&] { return posted != delivered; })) {
-                    return;
-                }
-            }
-            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
-            ++delivered;
-        }
-    });
-    {
-        std::scoped_lock lk{mutex};
-        ++posted;
-    }
-    cv.notify_one();
-}
-
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     // bbport: the flip interrupt follows the fences before it. On the draw recording thread it
     // goes behind those deferred to the Vulkan recording thread instead of that thread waiting
     // for them (U2's museum: ~10 ms a frame behind a fence held until the GPU is done; on the
-    // PS4 a flip also comes once the GPU is done), and is delivered on its own thread
-    // (PostFlipInterrupt). Toggle bit RecorderFlips: wait as before.
+    // PS4 a flip also comes once the GPU is done). Toggle bit RecorderFlips: wait as before.
     if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences) &&
         !BbToggle::Disabled(BbToggle::RecorderFlips)) {
         rasterizer.OnGuestFlip();
         rasterizer.GetBufferCache().CheckStableBindings();
         rasterizer.CheckConstants();
-        rasterizer.SignalAfterHostCopies([] { PostFlipInterrupt(); });
+        rasterizer.SignalAfterHostCopies(
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
         return;
     }
     rasterizer.WaitDeferredSignals();

@@ -270,11 +270,14 @@ void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal, bool new_w
         gpu_done->fetch_add(1, std::memory_order_release);
         done->fetch_add(1, std::memory_order_release);
     };
-    {
-        std::unique_lock lk(priority_pending_ops_mutex);
-        priority_pending_ops.emplace(Common::UniqueFunction<void>{std::move(op)}, gpu_signal_tick);
+    if (!gpu_signal_thread.joinable()) {
+        gpu_signal_thread = std::jthread(std::bind_front(&Scheduler::GpuSignalThread, this));
     }
-    priority_pending_ops_cv.notify_one();
+    {
+        std::unique_lock lk(gpu_signal_mutex);
+        gpu_signal_ops.emplace(Common::UniqueFunction<void>{std::move(op)}, gpu_signal_tick);
+    }
+    gpu_signal_cv.notify_one();
     if (new_work) {
         Flush();
     }
@@ -589,6 +592,27 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::GpuSignalThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuSignals");
+    while (!stoken.stop_requested()) {
+        PendingOp op;
+        {
+            std::unique_lock lk(gpu_signal_mutex);
+            gpu_signal_cv.wait(lk, stoken, [this] { return !gpu_signal_ops.empty(); });
+            if (stoken.stop_requested()) {
+                break;
+            }
+            op = std::move(gpu_signal_ops.front());
+            gpu_signal_ops.pop();
+        }
+        work_semaphore.Wait(op.gpu_tick);
+        if (stoken.stop_requested()) {
+            break;
+        }
+        op.callback();
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

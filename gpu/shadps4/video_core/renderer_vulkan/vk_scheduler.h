@@ -925,6 +925,7 @@ private:
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+    void GpuSignalThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
@@ -966,6 +967,12 @@ private:
     u64 gpu_signals_issued = 0;
     u64 gpu_signal_tick = 0; ///< the tick the newest SignalAfterGpu with new work waits for
     std::shared_ptr<std::atomic<u64>> gpu_signals_done = std::make_shared<std::atomic<u64>>(0);
+    // SignalAfterGpu's own thread: on the priority ops thread, operations waiting for ticks not
+    // yet submitted (buffers to free) held the guest's fences back (U2: 12 -> 5 FPS).
+    std::queue<PendingOp> gpu_signal_ops;
+    std::mutex gpu_signal_mutex;
+    std::condition_variable_any gpu_signal_cv;
+    std::jthread gpu_signal_thread;
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
     // bbport: whether recorder_thread runs, read on every Record(). std::jthread::joinable()

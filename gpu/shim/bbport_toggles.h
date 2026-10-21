@@ -71,6 +71,7 @@ enum : std::uint64_t {
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     ComputePipeline = 1ull << 58, ///< compute queue packets without a drain each (liverpool.cpp)
     RecorderEosFences = 1ull << 59, ///< end-of-shader fences signalled on the recording thread
+    DeferredFenceWaits = 1ull << 60, ///< WaitRegMem: fences run but not yet written count as pending
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

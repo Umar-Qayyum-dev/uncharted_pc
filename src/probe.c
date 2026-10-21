@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <malloc.h>
 #include <unistd.h>
+#include <sched.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <fcntl.h>
@@ -688,11 +689,56 @@ static unsigned char *near_image_memory(size_t size) {
 #endif
     return memory;
 }
+/* A thunk that calls `callback` (Microsoft x64: rdi, rsi, the image base, r14) with the guest's
+ * registers and flags kept, runs the `moved` bytes of position-independent instructions from `f`
+ * and jumps back; `f` jumps to it. 0 without thunk memory. */
+static unsigned char *callback_thunks;
+static size_t callback_thunks_used;
+static int callback_thunk(unsigned char *f, size_t moved, const void *callback) {
+    if (!callback_thunks && !(callback_thunks=near_image_memory(4096))) {
+        printf("Callbacks: no thunk memory\n");
+        return 0;
+    }
+    if (callback_thunks_used+256>4096) return 0;
+    unsigned char *t=callback_thunks+callback_thunks_used;
+    size_t k=0;
+    /* pushfq; push rax rcx rdx r8-r11 rbx; mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at
+     * a function's start and inside it) */
+    static const unsigned char save[]={0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x53,
+                                       0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xa0,0x00,0x00,0x00};
+    memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
+    for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x20+16x], xmmx */
+        const uint32_t disp=0x20u+16u*(uint32_t)x;
+        t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x7f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
+        memcpy(t+k,&disp,4); k+=4;
+    }
+    t[k++]=0x48; t[k++]=0x89; t[k++]=0xf9;                      /* mov rcx, rdi */
+    t[k++]=0x48; t[k++]=0x89; t[k++]=0xf2;                      /* mov rdx, rsi */
+    const uintptr_t base=(uintptr_t)image, host=(uintptr_t)callback;
+    t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
+    t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
+    t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;        /* movabs rax, callback */
+    t[k++]=0xff; t[k++]=0xd0;                                   /* call rax */
+    for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x20+16x] */
+        const uint32_t disp=0x20u+16u*(uint32_t)x;
+        t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x6f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
+        memcpy(t+k,&disp,4); k+=4;
+    }
+    /* mov rsp, rbx; pop rbx r11-r8 rdx rcx rax; popfq */
+    static const unsigned char restore[]={0x48,0x89,0xdc,0x5b,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,
+                                          0x5a,0x59,0x58,0x9d};
+    memcpy(t+k,restore,sizeof(restore)); k+=sizeof(restore);
+    memcpy(t+k,f,moved); k+=moved;                              /* the moved instructions */
+    int32_t back=(int32_t)((int64_t)(uintptr_t)(f+moved)-(int64_t)(uintptr_t)(t+k+5));
+    t[k++]=0xe9; memcpy(t+k,&back,4); k+=4;
+    int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(f+5));
+    f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,moved-5);
+    callback_thunks_used+=(k+15)&~(size_t)15;
+    return 1;
+}
 static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t image_size) {
     size_t count=0;
     const RuntimeGuestCallback *callbacks=runtime_guest_callbacks(&count);
-    unsigned char *thunks=NULL;
-    size_t used=0;
     guest_image_size=image_size;
     for (size_t i=0;i<count;++i) {
         const RuntimeGuestCallback *c=&callbacks[i];
@@ -703,44 +749,48 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,c->offset);
             continue;
         }
-        if (!thunks && !(thunks=near_image_memory(4096))) { printf("Callbacks: no thunk memory\n"); return; }
-        if (used+256>4096) break;
-        unsigned char *t=thunks+used, *f=image+c->offset;
-        size_t k=0;
-        /* pushfq; push rax rcx rdx r8-r11 rbx; mov rbx, rsp; and rsp, -16; sub rsp, 0xa0 (works at
-         * a function's start and inside it) */
-        static const unsigned char save[]={0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x53,
-                                           0x48,0x89,0xe3,0x48,0x83,0xe4,0xf0,0x48,0x81,0xec,0xa0,0x00,0x00,0x00};
-        memcpy(t+k,save,sizeof(save)); k+=sizeof(save);
-        for (int x=0;x<8;++x) {                                     /* movdqu [rsp+0x20+16x], xmmx */
-            const uint32_t disp=0x20u+16u*(uint32_t)x;
-            t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x7f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
-            memcpy(t+k,&disp,4); k+=4;
-        }
-        t[k++]=0x48; t[k++]=0x89; t[k++]=0xf9;                      /* mov rcx, rdi */
-        t[k++]=0x48; t[k++]=0x89; t[k++]=0xf2;                      /* mov rdx, rsi */
-        const uintptr_t base=(uintptr_t)image, host=(uintptr_t)c->callback;
-        t[k++]=0x49; t[k++]=0xb8; memcpy(t+k,&base,8); k+=8;        /* movabs r8, image */
-        t[k++]=0x4d; t[k++]=0x89; t[k++]=0xf1;                      /* mov r9, r14 */
-        t[k++]=0x48; t[k++]=0xb8; memcpy(t+k,&host,8); k+=8;        /* movabs rax, callback */
-        t[k++]=0xff; t[k++]=0xd0;                                   /* call rax */
-        for (int x=0;x<8;++x) {                                     /* movdqu xmmx, [rsp+0x20+16x] */
-            const uint32_t disp=0x20u+16u*(uint32_t)x;
-            t[k++]=0xf3; t[k++]=0x0f; t[k++]=0x6f; t[k++]=(unsigned char)(0x84|x<<3); t[k++]=0x24;
-            memcpy(t+k,&disp,4); k+=4;
-        }
-        /* mov rsp, rbx; pop rbx r11-r8 rdx rcx rax; popfq */
-        static const unsigned char restore[]={0x48,0x89,0xdc,0x5b,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,
-                                              0x5a,0x59,0x58,0x9d};
-        memcpy(t+k,restore,sizeof(restore)); k+=sizeof(restore);
-        memcpy(t+k,f,c->moved); k+=c->moved;                       /* the moved instructions */
-        int32_t back=(int32_t)((int64_t)(uintptr_t)(f+c->moved)-(int64_t)(uintptr_t)(t+k+5));
-        t[k++]=0xe9; memcpy(t+k,&back,4); k+=4;
-        int32_t to=(int32_t)((int64_t)(uintptr_t)t-(int64_t)(uintptr_t)(f+5));
-        f[0]=0xe9; memcpy(f+1,&to,4); memset(f+5,0x90,c->moved-5);
-        used+=(k+15)&~(size_t)15;
+        if (!callback_thunk(image+c->offset,c->moved,(const void *)c->callback)) return;
         printf("Callbacks: %s at %#" PRIx64 "\n",c->name,c->offset);
     }
+}
+/* Naughty Dog's job system: a worker with no job checks the queues again after a pause and only
+ * sleeps (scePthreadCondTimedwait) when a flag of the scheduler allows it, which it does not here:
+ * U2's museum, standing, 4-5 workers at 75-93 % CPU spun there on Umar's 4-core/8-thread PC
+ * (CPU at 98 %), and the game's main thread and the port's GPU threads got less of it. On the
+ * PS4 every worker has a core of its own. At the point both idle paths meet (mov r8, r14; cmp
+ * r13d, 3; ja; ...; rdtsc), found by its code in any version of the three games, the worker now
+ * yields its CPU to a thread that wants one (SwitchToThread: no wait when none does).
+ * BB_JOB_YIELD=0: off; BB_TOGGLE_FILE bit 61: off while running. */
+extern uint64_t runtime_disabled_optimizations;
+static void __attribute__((ms_abi)) job_idle_yield(uint64_t rdi, uint64_t rsi, uint64_t base,
+                                                   uint64_t r14) {
+    (void)rdi; (void)rsi; (void)base; (void)r14;
+    if (__atomic_load_n(&runtime_disabled_optimizations,__ATOMIC_RELAXED) & (UINT64_C(1)<<61)) return;
+#ifdef _WIN32
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+static void install_job_idle_yield(uint64_t image_size) {
+    const char *env=getenv("BB_JOB_YIELD");
+    if (env && env[0]=='0') return;
+    static const unsigned char head[]={0x4d,0x89,0xf0,0x41,0x83,0xfd,0x03};  /* mov r8,r14; cmp r13d,3 */
+    static const unsigned char tail[]={0x49,0x8b,0x07,0x4a,0x8b,0x8c,0xe0};   /* mov rax,[r15]; mov rcx,[rax+r12*8+d32] */
+    int hooked=0;
+    for (uint64_t at=0;at+32<=image_size;++at) {
+        const unsigned char *c=image+at;
+        if (c[0]!=0x4d || memcmp(c,head,sizeof(head))) continue;
+        size_t j=sizeof(head);
+        if (c[j]==0x0f && c[j+1]==0x87) j+=6;       /* ja rel32 */
+        else if (c[j]==0x77) j+=2;                  /* ja rel8 */
+        else continue;
+        if (memcmp(c+j,tail,sizeof(tail)) || c[j+sizeof(tail)+4]!=0x0f || c[j+sizeof(tail)+5]!=0x31) continue;
+        if (!callback_thunk(image+at,sizeof(head),(const void *)job_idle_yield)) break;
+        printf("Job workers: the idle check at %#" PRIx64 " yields the CPU\n",at);
+        ++hooked;
+    }
+    if (!hooked) printf("Job workers: idle check not found\n");
 }
 /* Naughty Dog's FrameBegin (ndlib/render/fg-draw-mgr.cpp) asserts that the frame it recycles,
  * three back, has its GPU end-of-pipe tick (set by the game's EOP interrupt handler). It never
@@ -1063,6 +1113,7 @@ int main(int argc, char **argv) {
         uint64_t image_end=0;
         for (uint64_t s=0;s<ns;++s) if (segments[s].address+segments[s].size>image_end) image_end=segments[s].address+segments[s].size;
         install_game_callbacks(segments, ns, image_end);
+        install_job_idle_yield(image_end);
         patch_eop_tick_wait(image_end);
     }
 #ifdef _WIN32

@@ -333,13 +333,13 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
 // third of the frame. Now packets that leave the caches alone, or are handed to the draw recording
 // thread in order (dispatches, as on the graphics queue; ReleaseMem, as end-of-pipe fences), go
 // without a drain, and a ReleaseMem is signalled on the recording thread after the copies queued
-// before it, without waiting here. BB_COMPUTE_PIPELINE=0: as before.
+// before it, without waiting here. BB_COMPUTE_PIPELINE=0 or toggle ComputePipeline: as before.
 bool ComputePipelined() {
     static const bool pipelined = [] {
         const char* env = std::getenv("BB_COMPUTE_PIPELINE");
         return !(env && env[0] == '0');
     }();
-    return pipelined;
+    return pipelined && !BbToggle::Disabled(BbToggle::ComputePipeline);
 }
 
 bool ComputeNeedsNoDrain(const PM4Header* header) {

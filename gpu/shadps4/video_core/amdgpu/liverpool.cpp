@@ -444,6 +444,29 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+    // bbport: as end-of-pipe fences, signalled by the recording thread after the copies queued
+    // before it instead of the draw recording thread waiting for them (U2's museum: ~12 a
+    // frame, ~8 ms of waiting). GDS stores keep the old path. BB_TOGGLE_FILE bit
+    // RecorderEosFences: as before.
+    if (event_eos.command == PM4CmdEventWriteEos::Command::SignalFence &&
+        Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences) &&
+        !BbToggle::Disabled(BbToggle::RecorderEosFences)) {
+        rasterizer.ProcessDownloadImages();
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        const auto eos = event_eos;
+        rasterizer.SignalAfterHostCopies([eos] {
+            eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes,
+                                 BbWriteLog::Fence);
+                if (!memory->TryWriteBacking(address, &value, num_bytes)) {
+                    memcpy(address, &value, num_bytes);
+                }
+            });
+        });
+        return;
+    }
     // Copies deferred to the recording thread precede writes the guest sees.
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();

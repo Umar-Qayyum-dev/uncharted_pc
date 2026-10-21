@@ -326,6 +326,65 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 }
 
+// bbport: the async compute queues carry many small jobs (U2's museum: ~1300 a frame, each
+// Nop, SetShReg, DispatchDirect, ReleaseMem). Each packet drained the draw pipe and each
+// ReleaseMem waited for the guest memory copies queued before it on the recording thread (those
+// of the graphics draws too): ~1300 drains and waits a frame stopped the GPU command thread for a
+// third of the frame. Now packets that leave the caches alone, or are handed to the draw recording
+// thread in order (dispatches, as on the graphics queue; ReleaseMem, as end-of-pipe fences), go
+// without a drain, and a ReleaseMem is signalled on the recording thread after the copies queued
+// before it, without waiting here. BB_COMPUTE_PIPELINE=0: as before.
+bool ComputePipelined() {
+    static const bool pipelined = [] {
+        const char* env = std::getenv("BB_COMPUTE_PIPELINE");
+        return !(env && env[0] == '0');
+    }();
+    return pipelined;
+}
+
+bool ComputeNeedsNoDrain(const PM4Header* header) {
+    if (header->type != 3) {
+        return false;
+    }
+    switch (header->type3.opcode.Value()) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::DispatchDirect: // drains itself when it runs here (HLE, indirect)
+    case PM4ItOpcode::IndirectBuffer: // its packets are judged one by one
+        return true;
+    case PM4ItOpcode::ReleaseMem: // handed over unless it stores GDS (drains itself then)
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct ComputeFence {
+    PM4CmdReleaseMem packet;
+    u32 pipe_id;
+};
+
+void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto fence = *reinterpret_cast<const ComputeFence*>(data);
+    rasterizer.ProcessDownloadImages();
+    rasterizer.GetBufferCache().CheckStableBindings();
+    rasterizer.CheckConstants();
+    const auto signal = [fence] {
+        fence.packet.SignalFence(
+            [pipe_id = fence.pipe_id] {
+                Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+            },
+            [](VAddr, u16, u16) { UNREACHABLE_MSG("GDS store fence handed over"); });
+    };
+    if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
+        rasterizer.SignalAfterHostCopies(signal);
+    } else {
+        rasterizer.WaitHostCopies();
+        rasterizer.WaitDeferredSignals();
+        signal();
+    }
+}
+
 void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* dma_data = reinterpret_cast<const PM4DmaData*>(data);
     ASSERT(dma_data->command.das == 0);
@@ -1416,8 +1475,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
-        if (rasterizer) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // bbport: compute work uses the caches
+        // bbport: compute work uses the caches (see ComputePipelined).
+        if (rasterizer &&
+            (!ComputePipelined() || queue.tmp_dwords != 0 ||
+             !ComputeNeedsNoDrain(reinterpret_cast<const PM4Header*>(acb.data())))) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
         }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
@@ -1570,6 +1632,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
                 rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
                 break;
             }
@@ -1648,9 +1711,33 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
+            if (const auto* fence = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+                rasterizer && ComputePipelined() &&
+                fence->data_sel.Value() != DataSelect::GdsMemStore) {
+                const ComputeFence task{*fence, queue.pipe_id};
+                if (rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task))) {
+                    // Pending in stream order: WaitRegMem counts it as written (PendingFenceValue).
+                    u32 bytes = 0;
+                    u64 value = 0;
+                    if (fence->data_sel.Value() == DataSelect::Data32Low) {
+                        bytes = sizeof(u32);
+                        value = fence->DataDWord();
+                    } else if (fence->data_sel.Value() == DataSelect::Data64) {
+                        bytes = sizeof(u64);
+                        value = fence->DataQWord();
+                    }
+                    if (bytes) {
+                        pending_fences.push_back(
+                            {fence->Address<VAddr>(), value, bytes, rasterizer->DrawPipeHead()});
+                        rasterizer->NotePendingGpuWrite(fence->Address<VAddr>(), bytes);
+                    }
+                }
+                break;
+            }
             // bbport: copies deferred to the recording thread precede writes the guest sees, and
-            // so do graphics fences deferred to it (the pipe was drained before this packet).
+            // so do graphics fences deferred to it.
             if (rasterizer) {
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
                 rasterizer->GetBufferCache().CheckStableBindings();

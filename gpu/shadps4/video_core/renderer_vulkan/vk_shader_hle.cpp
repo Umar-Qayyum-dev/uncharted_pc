@@ -405,12 +405,15 @@ public:
         {
             std::scoped_lock lk{mutex};
             ++deferred_fences;
+            ordered_fences += handoff->entries.empty();
         }
+        const bool new_work = !handoff->entries.empty();
         scheduler.SignalAfterGpu(
             [this, handoff, &buffer_cache, signal = std::move(signal)]() mutable {
                 Finish(*handoff, buffer_cache);
                 signal();
-            });
+            },
+            new_work);
         return true;
     }
 
@@ -530,13 +533,15 @@ private:
         }
         std::printf("Scalar copy read backs: %llu into guest memory 0/1/2/3+ frames after the "
                     "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full); %llu bytes written; "
-                    "%llu fences signalled after the GPU, %llu waits at fences",
+                    "%llu fences signalled after the GPU (%llu only to stay in order), %llu waits "
+                    "at fences",
                     static_cast<unsigned long long>(ages[0] + ages[1] + ages[2] + ages[3]),
                     static_cast<unsigned long long>(ages[0]), static_cast<unsigned long long>(ages[1]),
                     static_cast<unsigned long long>(ages[2]), static_cast<unsigned long long>(ages[3]),
                     static_cast<unsigned long long>(skipped),
                     static_cast<unsigned long long>(written_bytes),
                     static_cast<unsigned long long>(deferred_fences),
+                    static_cast<unsigned long long>(ordered_fences),
                     static_cast<unsigned long long>(fence_waits));
         if (Mode() == 2) {
             std::printf("; NPC verify: %llu compared with the slow read back, %llu mismatches",
@@ -546,6 +551,7 @@ private:
         std::printf("\n");
         ages = {};
         skipped = checked = differed = written_bytes = deferred_fences = fence_waits = 0;
+        ordered_fences = 0;
         window = now;
     }
 
@@ -557,7 +563,7 @@ private:
     std::deque<Entry> in_flight;
     std::array<u64, 4> ages{};
     u64 skipped = 0, checked = 0, differed = 0, written_bytes = 0;
-    u64 deferred_fences = 0, fence_waits = 0;
+    u64 deferred_fences = 0, ordered_fences = 0, fence_waits = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 

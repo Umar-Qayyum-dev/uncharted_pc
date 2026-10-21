@@ -893,8 +893,10 @@ public:
 
     /// bbport: runs `signal` (a guest fence) on the pending-ops thread once the GPU has
     /// completed the work recorded so far (submitted now), after the signals deferred before
-    /// it; writes the guest sees later wait for it (WaitDeferredSignals).
-    void SignalAfterGpu(Common::UniqueFunction<void>&& signal);
+    /// it; writes the guest sees later wait for it (WaitDeferredSignals). `new_work` false: a
+    /// fence that only has to stay behind the pending ones runs right after them, and nothing
+    /// is submitted for it.
+    void SignalAfterGpu(Common::UniqueFunction<void>&& signal, bool new_work = true);
 
     /// Signals SignalAfterGpu took that have not run yet.
     [[nodiscard]] bool GpuSignalsPending() const noexcept {
@@ -962,6 +964,7 @@ private:
     std::atomic<u64> host_copies_done{0};
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     u64 gpu_signals_issued = 0;
+    u64 gpu_signal_tick = 0; ///< the tick the newest SignalAfterGpu with new work waits for
     std::shared_ptr<std::atomic<u64>> gpu_signals_done = std::make_shared<std::atomic<u64>>(0);
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);

@@ -254,11 +254,14 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     KickRecording(true);
 }
 
-void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal) {
+void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal, bool new_work) {
     const u64 earlier = deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
     ++gpu_signals_issued;
-    DeferPriorityOperation([signal = std::move(signal), earlier, done = deferred_signals_done,
-                            gpu_done = gpu_signals_done]() mutable {
+    if (new_work) {
+        gpu_signal_tick = CurrentTick();
+    }
+    auto op = [signal = std::move(signal), earlier, done = deferred_signals_done,
+               gpu_done = gpu_signals_done]() mutable {
         // Fences are seen in order: the ones deferred before (to the recording thread) first.
         while (done->load(std::memory_order_acquire) < earlier) {
             std::this_thread::yield();
@@ -266,8 +269,15 @@ void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal) {
         signal();
         gpu_done->fetch_add(1, std::memory_order_release);
         done->fetch_add(1, std::memory_order_release);
-    });
-    Flush();
+    };
+    {
+        std::unique_lock lk(priority_pending_ops_mutex);
+        priority_pending_ops.emplace(Common::UniqueFunction<void>{std::move(op)}, gpu_signal_tick);
+    }
+    priority_pending_ops_cv.notify_one();
+    if (new_work) {
+        Flush();
+    }
 }
 
 void Scheduler::WaitDeferredSignals() {

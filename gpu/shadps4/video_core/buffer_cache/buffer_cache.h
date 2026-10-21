@@ -120,6 +120,17 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// bbport: the GPU's data of a range, copied out by earlier GPU work, into guest memory: only
+    /// the bytes that are still GPU data (newer guest writes stay), which stay GPU data (the GPU
+    /// keeps using its copy). Shadows of the page (ShadowGpuData) get the bytes too, so the next
+    /// merge does not take them for the guest's.
+    void WriteBackGpuData(VAddr addr, u64 size, const u8* data);
+
+    /// bbport: the range as the GPU sees it into `out` (GPU-written bytes from the GPU's copy,
+    /// waiting for the whole queue; the rest from guest memory). Guest memory and the cache's
+    /// state stay as they are. For checks (BB_SCALAR_COPY_READBACK=verify).
+    void PeekGpuData(VAddr addr, u64 size, u8* out);
+
     /// bbport: writes the image that starts at `addr` (its current GPU contents, tiled as in
     /// guest memory) into the buffer of that range, before a shader copies the range as plain
     /// memory. False when no image starts there.

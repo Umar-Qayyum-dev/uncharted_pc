@@ -2022,6 +2022,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
             cmdbuf.pipelineBarrier2(dependency);
         }
     });
+    if (IsGuestMemoryShaderHLE(cs.pgm_hash)) {
+        AfterGuestMemoryShaderDispatch(*this);
+    }
     DebugState.IncDispatch();
 
     ResetBindings(true);

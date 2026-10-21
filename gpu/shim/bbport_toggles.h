@@ -72,7 +72,7 @@ enum : std::uint64_t {
     ComputePipeline = 1ull << 58, ///< compute queue packets without a drain each (liverpool.cpp)
     RecorderEosFences = 1ull << 59, ///< end-of-shader fences signalled on the recording thread
     DeferredFenceWaits = 1ull << 60, ///< WaitRegMem: fences run but not yet written count as pending
-    RecorderLabelWrites = 1ull << 63, ///< WriteData does not wait for deferred fences (PS4 order)
+    RecorderLabelWrites = 1ull << 63, ///< small WriteData written behind deferred fences, no wait
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

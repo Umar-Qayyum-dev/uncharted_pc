@@ -13,7 +13,11 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // bbport: addr64 buffer loads (ReadConst windows)
+// bbport: 10 = ReadConst windows of ReadConstWindowDwords() (its value is part of the version, so
+// a different BB_READCONST_WINDOW_DWORDS rebuilds the cache).
+static u32 ShaderBinaryVersion() {
+    return 10u | (Shader::ReadConstWindowDwords() << 8);
+}
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization
@@ -70,7 +74,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(Serialization::ShaderBinaryVersion());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -105,7 +109,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != Serialization::ShaderBinaryVersion()) {
         return false;
     }
 

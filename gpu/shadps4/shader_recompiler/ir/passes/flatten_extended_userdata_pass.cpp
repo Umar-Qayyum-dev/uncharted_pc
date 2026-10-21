@@ -668,16 +668,20 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         pass_info.dst_off_dw++;
     }
     // bbport: reads at offsets that vary per lane share a copy of the block's first
-    // ReadConstWindowDwords dwords (ReadConstWindowFlag).
+    // ReadConstWindowDwords() dwords (ReadConstWindowFlag). Flat buffer offsets are 16-bit: a
+    // window that would not leave room for the rest gets the small size (and its flag).
     if (!windowed.empty()) {
         const u32 start = pass_info.dst_off_dw;
-        for (u32 i = 0; i < ReadConstWindowDwords; ++i) {
+        const bool fits = start + ReadConstWindowDwords() + 4096u <= 0xFFFFu;
+        const u32 dwords = fits ? ReadConstWindowDwords() : ReadConstSmallWindowDwords;
+        for (u32 i = 0; i < dwords; ++i) {
             c.mov(r10d, ptr[rdi + (i << 2)]);
             c.mov(ptr[rsi + ((start + i) << 2)], r10d);
         }
-        pass_info.dst_off_dw += ReadConstWindowDwords;
+        pass_info.dst_off_dw += dwords;
         for (IR::Inst* use : windowed) {
-            use->SetFlags<u32>(start | ReadConstWindowFlag);
+            use->SetFlags<u32>(start | ReadConstWindowFlag |
+                               (dwords == ReadConstWindowDwords() ? 0u : ReadConstSmallWindowFlag));
         }
     }
 

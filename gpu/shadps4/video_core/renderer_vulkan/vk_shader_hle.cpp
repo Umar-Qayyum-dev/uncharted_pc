@@ -329,7 +329,10 @@ public:
                 ++checked;
                 differed += std::memcmp(entry.truth.data(), data, entry.size) != 0;
             }
-            buffer_cache.WriteBackGpuData(entry.dst, entry.size, data);
+            changed += std::memcmp(reinterpret_cast<const void*>(entry.dst), data, entry.size) != 0;
+            const u64 written = buffer_cache.WriteBackGpuData(entry.dst, entry.size, data);
+            written_bytes += written;
+            none_left += written == 0;
             ++ages[std::min<u64>(3, frame - entry.frame)];
             in_flight.pop_front();
         }
@@ -384,11 +387,14 @@ private:
             return;
         }
         std::printf("Scalar copy read backs: %llu into guest memory 0/1/2/3+ frames after the "
-                    "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full)",
+                    "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full); %llu changed guest memory, "
+                    "%llu bytes written, %llu had no GPU data left",
                     static_cast<unsigned long long>(ages[0] + ages[1] + ages[2] + ages[3]),
                     static_cast<unsigned long long>(ages[0]), static_cast<unsigned long long>(ages[1]),
                     static_cast<unsigned long long>(ages[2]), static_cast<unsigned long long>(ages[3]),
-                    static_cast<unsigned long long>(skipped));
+                    static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(changed),
+                    static_cast<unsigned long long>(written_bytes),
+                    static_cast<unsigned long long>(none_left));
         if (Mode() == 2) {
             std::printf("; NPC verify: %llu compared with the slow read back, %llu mismatches",
                         static_cast<unsigned long long>(checked),
@@ -396,7 +402,7 @@ private:
         }
         std::printf("\n");
         ages = {};
-        skipped = checked = differed = 0;
+        skipped = checked = differed = changed = written_bytes = none_left = 0;
         window = now;
     }
 
@@ -405,7 +411,7 @@ private:
     std::vector<Entry> queued;
     std::deque<Entry> in_flight;
     std::array<u64, 4> ages{};
-    u64 skipped = 0, checked = 0, differed = 0;
+    u64 skipped = 0, checked = 0, differed = 0, changed = 0, written_bytes = 0, none_left = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 

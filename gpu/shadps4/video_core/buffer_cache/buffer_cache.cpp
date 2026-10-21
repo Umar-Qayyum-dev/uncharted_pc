@@ -535,10 +535,12 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
-void BufferCache::WriteBackGpuData(VAddr addr, u64 size, const u8* data) {
+u64 BufferCache::WriteBackGpuData(VAddr addr, u64 size, const u8* data) {
     std::scoped_lock lk{shadow_mutex};
+    u64 written = 0;
     gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
         memory->TryWriteBacking(reinterpret_cast<void*>(start), data + (start - addr), end - start);
+        written += end - start;
         if (shadow_pages.load(std::memory_order_relaxed) == 0) {
             return;
         }
@@ -558,6 +560,7 @@ void BufferCache::WriteBackGpuData(VAddr addr, u64 size, const u8* data) {
             }
         }
     });
+    return written;
 }
 
 void BufferCache::PeekGpuData(VAddr addr, u64 size, u8* out) {

@@ -124,7 +124,8 @@ public:
     /// the bytes that are still GPU data (newer guest writes stay), which stay GPU data (the GPU
     /// keeps using its copy). Shadows of the page (ShadowGpuData) get the bytes too, so the next
     /// merge does not take them for the guest's.
-    void WriteBackGpuData(VAddr addr, u64 size, const u8* data);
+    /// Returns the bytes written.
+    u64 WriteBackGpuData(VAddr addr, u64 size, const u8* data);
 
     /// bbport: the range as the GPU sees it into `out` (GPU-written bytes from the GPU's copy,
     /// waiting for the whole queue; the rest from guest memory). Guest memory and the cache's

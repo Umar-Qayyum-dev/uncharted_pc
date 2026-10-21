@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "bbport_wait.h"
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -34,7 +35,7 @@ public:
         if (thread.joinable()) {
             thread.request_stop();
             posted.fetch_add(1, std::memory_order_seq_cst);
-            posted.notify_one();
+            BbWait::WakeOne(posted);
         }
     }
 
@@ -59,7 +60,7 @@ public:
         active = true;
         posted.fetch_add(1, std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_seq_cst)) {
-            posted.notify_one();
+            BbWait::WakeOne(posted);
         }
     }
 
@@ -97,7 +98,7 @@ private:
                 __builtin_ia32_pause();
                 if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                     sleeping.store(true, std::memory_order_seq_cst);
-                    posted.wait(seen, std::memory_order_seq_cst);
+                    BbWait::Wait(posted, seen);
                     sleeping.store(false, std::memory_order_relaxed);
                 }
                 now = posted.load(std::memory_order_acquire);

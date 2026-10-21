@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "bbport_threads.h"
+#include "bbport_wait.h"
 
 #include <array>
 #include <atomic>
@@ -43,7 +44,7 @@ public:
         thread.request_stop();
         published.fetch_add(0, std::memory_order_seq_cst);
         wake.fetch_add(1, std::memory_order_seq_cst);
-        wake.notify_one();
+        BbWait::WakeOne(wake);
     }
 
     /// True on the draw recording thread.
@@ -84,7 +85,7 @@ public:
         ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
             wake.fetch_add(1, std::memory_order_seq_cst);
-            wake.notify_one();
+            BbWait::WakeOne(wake);
         }
     }
 
@@ -185,7 +186,7 @@ private:
                         sleeping.store(true, std::memory_order_seq_cst);
                         if (published.load(std::memory_order_seq_cst) == at &&
                             !stop.stop_requested()) {
-                            wake.wait(seen, std::memory_order_seq_cst);
+                            BbWait::Wait(wake, seen);
                         }
                         sleeping.store(false, std::memory_order_relaxed);
                     }

@@ -427,39 +427,35 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
 }
 
-void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
+void RunWriteDataImpl(Vulkan::Rasterizer& rasterizer, const u8* data, bool ordered) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
-    const u32 num_bytes = (header->type3.count.Value() - 2) * sizeof(u32);
-    // bbport: a label (up to 8 bytes) goes behind the copies and fences deferred to the Vulkan
-    // recording thread instead of the draw recording thread waiting for them (U2's museum: one a
-    // frame, ~12 ms of waiting behind a fence held until the GPU is done). Larger writes may be
-    // data later draws read: they keep the wait. Toggle bit RecorderLabelWrites: as before.
-    if (num_bytes <= sizeof(u64) && Vulkan::DrawPipe::OnStageB() &&
-        !BbToggle::Disabled(BbToggle::RecorderFences) &&
-        !BbToggle::Disabled(BbToggle::RecorderLabelWrites)) {
-        rasterizer.GetBufferCache().CheckStableBindings();
-        rasterizer.CheckConstants();
-        u64 value = 0;
-        std::memcpy(&value, write_data->data, num_bytes);
-        auto* address = write_data->Address<u8*>();
-        rasterizer.SignalAfterHostCopies([address, value, num_bytes] {
-            BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes,
-                             BbWriteLog::WriteData);
-            std::memcpy(address, &value, num_bytes);
-        });
-        return;
-    }
-    // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
-    // precede writes the guest sees.
+    // Copies deferred to the recording thread precede writes the guest sees. bbport: fences
+    // deferred to it do not: on the PS4 the command processor writes this data when it reaches
+    // the packet, and an end-of-pipe fence before it only when the GPU has finished, so the
+    // data may well be seen first. Waiting for them stopped the draw recording thread ~9 ms a
+    // frame in U2's museum (one WriteData behind a fence held until the GPU is done), the
+    // bottleneck by then. A write to an address a pending fence writes too stays behind it
+    // (`ordered`), else memory would end with the fence's older value. Toggle bit
+    // RecorderLabelWrites: wait for them always.
     rasterizer.WaitHostCopies();
-    rasterizer.WaitDeferredSignals();
+    if (ordered || BbToggle::Disabled(BbToggle::RecorderLabelWrites)) {
+        rasterizer.WaitDeferredSignals();
+    }
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
                 (header->type3.count.Value() - 2) * sizeof(u32));
+}
+
+void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    RunWriteDataImpl(rasterizer, data, false);
+}
+
+void RunWriteDataOrdered(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    RunWriteDataImpl(rasterizer, data, true);
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -1345,7 +1341,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BbWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,
                                            (count - 2) * sizeof(u32),
                                            BbWriteLog::WriteDataIntent);
-                    if (rasterizer->RunInOrder(&RunWriteData, header, (count + 1) * sizeof(u32),
+                    // A pending fence on the same bytes: the write stays behind it.
+                    bool ordered = false;
+                    const VAddr at = write_data->Address<VAddr>();
+                    const u64 bytes = (count - 2) * sizeof(u32);
+                    for (const auto& fence : pending_fences) {
+                        if (at < fence.address + fence.num_bytes && fence.address < at + bytes) {
+                            ordered = true;
+                            break;
+                        }
+                    }
+                    if (rasterizer->RunInOrder(ordered ? &RunWriteDataOrdered : &RunWriteData,
+                                               header, (count + 1) * sizeof(u32),
                                                BbToggle::PipelinedMemoryWrites)) {
                         NotePendingWrite(*write_data, (count - 2) * sizeof(u32));
                         rasterizer->NotePendingGpuWrite(write_data->Address<VAddr>(),

@@ -851,6 +851,12 @@ public:
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
     void WaitDeferredSignals();
 
+    /// bbport: fences deferred to the Vulkan recording thread that have not been written yet.
+    [[nodiscard]] bool DeferredSignalsPending() const noexcept {
+        return deferred_signals_done->load(std::memory_order_acquire) <
+               deferred_signals_issued.load(std::memory_order_relaxed);
+    }
+
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;

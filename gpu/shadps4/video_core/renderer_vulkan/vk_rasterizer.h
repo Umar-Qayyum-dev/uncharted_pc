@@ -122,6 +122,10 @@ public:
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
+    /// Fences deferred to the Vulkan recording thread not written yet.
+    [[nodiscard]] bool DeferredSignalsPending() const {
+        return scheduler.DeferredSignalsPending();
+    }
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
     }

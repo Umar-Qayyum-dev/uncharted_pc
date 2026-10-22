@@ -2,8 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -17,6 +25,10 @@
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+
+namespace Libraries::VideoOut {
+u64 EopFlipsReached();
+}
 
 namespace Vulkan {
 
@@ -246,8 +258,338 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 static constexpr u64 SCALAR_COPY_SHADER_HASH = 0x2d215c3b;    // one dword per workgroup
 static constexpr u64 SCALAR_COPY64_SHADER_HASH = 0x6a6422a9;  // 64 dwords per workgroup (U2)
 
+// bbport: the games' CPU code reads some of the blocks these copies fill. Uncharted 2's character
+// update loads an index from one (guest offset 0xc47d8c): copied on the GPU alone, guest memory
+// kept data from long before, and NPCs were drawn floating, sunk or without legs while they stood
+// right (hard to hit). BB_SCALAR_COPY_SYNC=1 read the source back first, waiting for the GPU
+// (U2 museum: 27 -> 15 FPS). Instead, right behind the copy, the GPU also copies the destination
+// into a host-visible ring, and the bytes go into guest memory (only bytes still GPU data)
+// before the guest sees the next end-of-pipe fence: the game reads them after that fence, as on
+// the PS4 (a frame later was too late: the NPCs stayed wrong). The fence is signalled once that
+// work has completed, as the PS4's is; the GPU command thread does not wait for it (waiting
+// there cost a third of the frame rate). BB_SCALAR_COPY_READBACK=0: off; =wait: wait at the
+// fence; =late: no fence, written back at the next copy once completed; =verify: as the
+// default, and every 8th one is also read back the slow way and compared (BB_FRAME_STATS=1
+// prints counts every 5 s).
+class ScalarCopyReadback {
+public:
+    static constexpr u64 Capacity = 4_MB;
+
+    /// 0 off, 1 at fences (default), 2 verify (at fences), 3 late, 4 at fences, waiting there.
+    static int Mode() {
+        static const int mode = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY_READBACK");
+            if (!env) {
+                return 1;
+            }
+            if (env[0] == '0') {
+                return 0;
+            }
+            if (std::strcmp(env, "verify") == 0) {
+                return 2;
+            }
+            if (std::strcmp(env, "late") == 0) {
+                return 3;
+            }
+            return std::strcmp(env, "wait") == 0 ? 4 : 1;
+        }();
+        return mode;
+    }
+
+    /// A copy whose destination guest memory does not get; `truth`: its data (verify) or empty.
+    void Queue(VAddr dst, u64 size, std::vector<u8> truth) {
+        queued.push_back({dst, size, 0, 0, 0, 0, State::Pending, std::move(truth)});
+    }
+
+    /// After the copy's dispatch was recorded: the destination into the ring, on the GPU.
+    void Record(Rasterizer& rasterizer) {
+        if (queued.empty()) {
+            return;
+        }
+        auto& runtime = rasterizer.GetRuntime();
+        auto& buffer_cache = rasterizer.GetBufferCache();
+        if (!ring) {
+            ring = std::make_unique<VideoCore::Buffer>(runtime.GetInstance(), 0, Capacity,
+                                                       VideoCore::MemoryType::HostCached,
+                                                       "ScalarCopyReadback");
+        }
+        std::scoped_lock lk{mutex};
+        for (auto& entry : queued) {
+            const auto offset = Allocate(entry.size);
+            if (!offset || ring->mapped_data.empty()) {
+                ++skipped;
+                continue;
+            }
+            const auto [buffer, buffer_offset] =
+                buffer_cache.ObtainBuffer(entry.dst, static_cast<u32>(entry.size), false);
+            const vk::BufferCopy copy{buffer_offset, *offset, entry.size};
+            runtime.CopyBuffer(buffer, ring.get(), std::span{&copy, 1});
+            entry.offset = *offset;
+            entry.tick = runtime.GetScheduler().CurrentTick();
+            entry.frame = Libraries::VideoOut::EopFlipsReached();
+            entry.id = next_id++;
+            in_flight.push_back(std::move(entry));
+        }
+        queued.clear();
+        // Submitted now, the copies have usually completed by the next fence, which then needs
+        // not wait for the GPU (the work recorded up to it).
+        runtime.GetScheduler().Flush();
+    }
+
+    /// Copies whose GPU work has completed, into guest memory (none handed to a fence before).
+    void WriteBack(Rasterizer& rasterizer) {
+        auto& scheduler = rasterizer.GetRuntime().GetScheduler();
+        auto& buffer_cache = rasterizer.GetBufferCache();
+        std::scoped_lock lk{mutex};
+        for (auto& entry : in_flight) {
+            if (entry.state == State::HandedOff) {
+                break; // a fence writes it later: newer data must not go first
+            }
+            if (entry.state == State::Released) {
+                continue;
+            }
+            if (!scheduler.IsFree(entry.tick)) {
+                break;
+            }
+            ring->Invalidate(entry.offset, entry.size);
+            const u8* data = ring->mapped_data.data() + entry.offset;
+            Check(entry, data);
+            const u64 written = buffer_cache.WriteBackGpuData(entry.dst, entry.size, data);
+            Count(entry, written);
+            entry.state = State::Released;
+        }
+        PopReleased();
+        PrintStats();
+    }
+
+    /// Before an end-of-pipe fence the guest sees. The copies so far must be in guest memory
+    /// when the guest sees the fence: the fence is signalled from the scheduler's pending-ops
+    /// thread once their GPU work has completed, right after they are written back (the GPU
+    /// command thread goes on). Later fences follow it in order. Returns true when `signal`
+    /// was taken. BB_SCALAR_COPY_READBACK=wait: waits here instead.
+    bool BeforeFence(Rasterizer& rasterizer, Common::UniqueFunction<void>& signal) {
+        if (Mode() == 3) {
+            return false;
+        }
+        auto& scheduler = rasterizer.GetRuntime().GetScheduler();
+        auto& buffer_cache = rasterizer.GetBufferCache();
+        auto handoff = std::make_shared<Handoff>();
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& entry : in_flight) {
+                if (entry.state != State::Pending) {
+                    continue;
+                }
+                // Decided here, where GPU writes are tracked: the bytes still GPU data.
+                for (const auto& [start, end] : buffer_cache.GpuWrittenParts(entry.dst, entry.size)) {
+                    handoff->parts.push_back(
+                        {start, end - start, entry.offset + (start - entry.dst)});
+                }
+                handoff->entries.push_back({entry.id, entry.offset, entry.size, entry.frame,
+                                            std::move(entry.truth)});
+                handoff->tick = std::max(handoff->tick, entry.tick);
+                entry.state = State::HandedOff;
+            }
+        }
+        if (handoff->entries.empty() && !scheduler.GpuSignalsPending()) {
+            return false;
+        }
+        if (!scheduler.GpuSignalsPending() && scheduler.IsFree(handoff->tick)) {
+            // Completed already: written back here, and the fence goes as usual.
+            Finish(*handoff, buffer_cache);
+            std::scoped_lock lk{mutex};
+            ++completed_fences;
+            return false;
+        }
+        if (Mode() == 4) {
+            if (!handoff->entries.empty() && !scheduler.IsFree(handoff->tick)) {
+                {
+                    std::scoped_lock lk{mutex};
+                    ++fence_waits;
+                }
+                scheduler.Wait(handoff->tick);
+            }
+            Finish(*handoff, buffer_cache);
+            return false;
+        }
+        {
+            std::scoped_lock lk{mutex};
+            ++deferred_fences;
+            ordered_fences += handoff->entries.empty();
+        }
+        const bool new_work = !handoff->entries.empty();
+        scheduler.SignalAfterGpu(
+            [this, handoff, &buffer_cache, signal = std::move(signal)]() mutable {
+                Finish(*handoff, buffer_cache);
+                signal();
+            },
+            new_work);
+        return true;
+    }
+
+private:
+    enum class State : u8 { Pending, HandedOff, Released };
+    struct Entry {
+        VAddr dst;
+        u64 size;
+        u64 offset;
+        u64 tick;
+        u64 frame;
+        u64 id;
+        State state;
+        std::vector<u8> truth;
+    };
+    struct Handoff {
+        struct Part {
+            VAddr addr;
+            u64 size;
+            u64 ring_offset;
+        };
+        struct Done {
+            u64 id, offset, size, frame;
+            std::vector<u8> truth;
+        };
+        std::vector<Part> parts;
+        std::vector<Done> entries;
+        u64 tick = 0;
+    };
+
+    /// Writes a fence's copies (their GPU work has completed) and frees their ring space.
+    void Finish(Handoff& handoff, VideoCore::BufferCache& buffer_cache) {
+        for (const auto& done : handoff.entries) {
+            ring->Invalidate(done.offset, done.size);
+        }
+        thread_local std::vector<VideoCore::BufferCache::WritePart> writes;
+        writes.clear();
+        for (const auto& part : handoff.parts) {
+            writes.push_back({part.addr, ring->mapped_data.data() + part.ring_offset, part.size});
+        }
+        const u64 written = buffer_cache.WriteBackParts(writes);
+        const u64 frame = Libraries::VideoOut::EopFlipsReached();
+        std::scoped_lock lk{mutex};
+        written_bytes += written;
+        for (auto& done : handoff.entries) {
+            if (!done.truth.empty()) {
+                ++checked;
+                differed += std::memcmp(done.truth.data(), ring->mapped_data.data() + done.offset,
+                                        done.size) != 0;
+            }
+            ++ages[std::min<u64>(3, frame - done.frame)];
+            for (auto& entry : in_flight) {
+                if (entry.id == done.id) {
+                    entry.state = State::Released;
+                    break;
+                }
+            }
+        }
+        PopReleased();
+    }
+
+    void Check(Entry& entry, const u8* data) {
+        if (!entry.truth.empty()) {
+            ++checked;
+            differed += std::memcmp(entry.truth.data(), data, entry.size) != 0;
+        }
+    }
+
+    void Count(const Entry& entry, u64 written) {
+        written_bytes += written;
+        ++ages[std::min<u64>(3, Libraries::VideoOut::EopFlipsReached() - entry.frame)];
+    }
+
+    void PopReleased() {
+        while (!in_flight.empty() && in_flight.front().state == State::Released) {
+            in_flight.pop_front();
+        }
+    }
+
+    /// Ring space for `size` bytes after the newest copy; the oldest one in flight bounds it.
+    std::optional<u64> Allocate(u64 size) {
+        size = Common::AlignUp(size, 256);
+        if (size >= Capacity) {
+            return std::nullopt;
+        }
+        PopReleased();
+        if (in_flight.empty()) {
+            head = size;
+            return 0;
+        }
+        const u64 tail = in_flight.front().offset;
+        u64 offset;
+        if (head >= tail) {
+            if (head + size <= Capacity) {
+                offset = head;
+            } else if (size < tail) {
+                offset = 0;
+            } else {
+                return std::nullopt;
+            }
+        } else if (head + size < tail) {
+            offset = head;
+        } else {
+            return std::nullopt;
+        }
+        head = offset + size;
+        return offset;
+    }
+
+    void PrintStats() {
+        if (!BbStats::enabled) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window < std::chrono::seconds(5)) {
+            return;
+        }
+        std::printf("Scalar copy read backs: %llu into guest memory 0/1/2/3+ frames after the "
+                    "copy: %llu/%llu/%llu/%llu, %llu skipped (ring full); %llu bytes written; "
+                    "%llu fences signalled after the GPU (%llu only to stay in order), %llu with "
+                    "the copies completed, %llu waits at fences",
+                    static_cast<unsigned long long>(ages[0] + ages[1] + ages[2] + ages[3]),
+                    static_cast<unsigned long long>(ages[0]), static_cast<unsigned long long>(ages[1]),
+                    static_cast<unsigned long long>(ages[2]), static_cast<unsigned long long>(ages[3]),
+                    static_cast<unsigned long long>(skipped),
+                    static_cast<unsigned long long>(written_bytes),
+                    static_cast<unsigned long long>(deferred_fences),
+                    static_cast<unsigned long long>(ordered_fences),
+                    static_cast<unsigned long long>(completed_fences),
+                    static_cast<unsigned long long>(fence_waits));
+        if (Mode() == 2) {
+            std::printf("; NPC verify: %llu compared with the slow read back, %llu mismatches",
+                        static_cast<unsigned long long>(checked),
+                        static_cast<unsigned long long>(differed));
+        }
+        std::printf("\n");
+        ages = {};
+        skipped = checked = differed = written_bytes = deferred_fences = fence_waits = 0;
+        ordered_fences = completed_fences = 0;
+        window = now;
+    }
+
+    std::unique_ptr<VideoCore::Buffer> ring;
+    std::mutex mutex; ///< in_flight, head and the counts: the pending-ops thread frees entries
+    u64 head = 0;
+    u64 next_id = 0;
+    std::vector<Entry> queued;
+    std::deque<Entry> in_flight;
+    std::array<u64, 4> ages{};
+    u64 skipped = 0, checked = 0, differed = 0, written_bytes = 0;
+    u64 deferred_fences = 0, ordered_fences = 0, completed_fences = 0, fence_waits = 0;
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+
+/// Used where the copy shaders' dispatches are processed (the GPU command thread, with the
+/// draw recording thread drained).
+static ScalarCopyReadback& Readback() {
+    static ScalarCopyReadback readback;
+    return readback;
+}
+
 static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer, u64 group_size) {
+    if (ScalarCopyReadback::Mode()) {
+        Readback().WriteBack(rasterizer);
+    }
     if (info.buffers.size() != 2 || BbToggle::Disabled(BbToggle::MultiCopyShader)) {
         return false;
     }
@@ -298,7 +640,8 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
         // tracker flags whole pages, so most of these sources were never written by the GPU:
         // their guest memory is current and small copies are made there as well.
         // BB_SCALAR_COPY_BOTH=0: GPU copy only (A/B). BB_SCALAR_COPY_SYNC=1: sources the GPU did
-        // write are read back first (waits for the GPU).
+        // write are read back first (waits for the GPU); else the destination is read back
+        // after the copy without waiting (ScalarCopyReadback).
         static const bool both = [] {
             const char* env = std::getenv("BB_SCALAR_COPY_BOTH");
             return !(env && env[0] == '0');
@@ -324,6 +667,16 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
         } else if (both && size < 1_MB) {
             if (src_written && sync) {
                 buffer_cache.ReadMemory(src.base_address, size, false, true);
+            } else if (src_written && ScalarCopyReadback::Mode() &&
+                       memory->IsValidGpuMapping(dst.base_address, size)) {
+                std::vector<u8> truth;
+                static u32 copies = 0;
+                if (ScalarCopyReadback::Mode() == 2 && (copies++ & 7) == 0 &&
+                    memory->IsValidGpuMapping(src.base_address, size)) {
+                    truth.resize(size);
+                    buffer_cache.PeekGpuData(src.base_address, size, truth.data());
+                }
+                Readback().Queue(dst.base_address, size, std::move(truth));
             }
             if ((!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
                 memory->IsValidGpuMapping(dst.base_address, size)) {
@@ -361,6 +714,16 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
     // Only the images overlapping the exact range: the uploads read guest memory here.
     rasterizer.GetTextureCache().InvalidateMemoryFromGPU(dst.base_address, size, true);
     return true;
+}
+
+bool DeferGuestFence(Rasterizer& rasterizer, Common::UniqueFunction<void>& signal) {
+    return ScalarCopyReadback::Mode() && Readback().BeforeFence(rasterizer, signal);
+}
+
+void AfterGuestMemoryShaderDispatch(Rasterizer& rasterizer) {
+    if (ScalarCopyReadback::Mode()) {
+        Readback().Record(rasterizer);
+    }
 }
 
 bool IsGuestMemoryShaderHLE(unsigned long long pgm_hash) {

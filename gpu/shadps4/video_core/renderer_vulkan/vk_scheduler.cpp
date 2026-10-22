@@ -238,6 +238,31 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
 }
 
 void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
+    if (GpuSignalsPending()) {
+        // bbport: a fence signalled after the GPU (SignalAfterGpu) is pending: this one goes
+        // behind it, on its thread, once the copies before it are done (fences stay in order).
+        auto copies_done = std::make_shared<std::atomic<bool>>(false);
+        if (IsRecordingDeferred()) {
+            BbCopy::FlushBatch();
+            Record([copies_done](vk::CommandBuffer) {
+                BbCopy::AfterCopies(
+                    [copies_done] { copies_done->store(true, std::memory_order_release); });
+            });
+            KickRecording(true);
+        } else {
+            WaitHostCopies();
+            copies_done->store(true, std::memory_order_release);
+        }
+        SignalAfterGpu(
+            [copies_done, signal = std::move(signal)]() mutable {
+                while (!copies_done->load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                signal();
+            },
+            false);
+        return;
+    }
     if (!IsRecordingDeferred()) {
         WaitHostCopies();
         signal();
@@ -252,6 +277,35 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
         });
     });
     KickRecording(true);
+}
+
+void Scheduler::SignalAfterGpu(Common::UniqueFunction<void>&& signal, bool new_work) {
+    const u64 earlier = deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    ++gpu_signals_issued;
+    if (new_work) {
+        gpu_signal_tick = CurrentTick();
+    }
+    auto op = [signal = std::move(signal), earlier, done = deferred_signals_done,
+               gpu_done = gpu_signals_done]() mutable {
+        // Fences are seen in order: the ones deferred before (to the recording thread) first.
+        while (done->load(std::memory_order_acquire) < earlier) {
+            std::this_thread::yield();
+        }
+        signal();
+        gpu_done->fetch_add(1, std::memory_order_release);
+        done->fetch_add(1, std::memory_order_release);
+    };
+    if (!gpu_signal_thread.joinable()) {
+        gpu_signal_thread = std::jthread(std::bind_front(&Scheduler::GpuSignalThread, this));
+    }
+    {
+        std::unique_lock lk(gpu_signal_mutex);
+        gpu_signal_ops.emplace(Common::UniqueFunction<void>{std::move(op)}, gpu_signal_tick);
+    }
+    gpu_signal_cv.notify_one();
+    if (new_work) {
+        Flush();
+    }
 }
 
 void Scheduler::WaitDeferredSignals() {
@@ -563,6 +617,27 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::GpuSignalThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuSignals");
+    while (!stoken.stop_requested()) {
+        PendingOp op;
+        {
+            std::unique_lock lk(gpu_signal_mutex);
+            gpu_signal_cv.wait(lk, stoken, [this] { return !gpu_signal_ops.empty(); });
+            if (stoken.stop_requested()) {
+                break;
+            }
+            op = std::move(gpu_signal_ops.front());
+            gpu_signal_ops.pop();
+        }
+        work_semaphore.Wait(op.gpu_tick);
+        if (stoken.stop_requested()) {
+            break;
+        }
+        op.callback();
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

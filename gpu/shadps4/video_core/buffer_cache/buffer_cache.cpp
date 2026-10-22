@@ -535,6 +535,75 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
+u64 BufferCache::WriteBackGpuData(VAddr addr, u64 size, const u8* data) {
+    std::vector<WritePart> parts;
+    for (const auto& [start, end] : GpuWrittenParts(addr, size)) {
+        parts.push_back({start, data + (start - addr), end - start});
+    }
+    return WriteBackParts(parts);
+}
+
+std::vector<std::pair<VAddr, VAddr>> BufferCache::GpuWrittenParts(VAddr addr, u64 size) const {
+    std::vector<std::pair<VAddr, VAddr>> parts;
+    gpu_modified_ranges.ForEachInRange(addr, size,
+                                       [&](VAddr start, VAddr end) { parts.emplace_back(start, end); });
+    return parts;
+}
+
+u64 BufferCache::WriteBackParts(std::span<const WritePart> parts) {
+    std::scoped_lock lk{shadow_mutex};
+    u64 written = 0;
+    for (const auto& part : parts) {
+        memory->TryWriteBacking(reinterpret_cast<void*>(part.addr), part.data, part.size);
+        written += part.size;
+        if (shadow_pages.load(std::memory_order_relaxed) == 0) {
+            continue;
+        }
+        const VAddr end = part.addr + part.size;
+        for (VAddr page = Common::AlignDown(part.addr, TRACKER_BYTES_PER_PAGE); page < end;
+             page += TRACKER_BYTES_PER_PAGE) {
+            const auto it = shadows.find(page);
+            if (it == shadows.end()) {
+                continue;
+            }
+            for (auto& shadow : it->second) {
+                const VAddr from = std::max(part.addr, shadow.start);
+                const VAddr to = std::min<VAddr>(end, shadow.start + shadow.bytes.size());
+                if (from < to) {
+                    std::memcpy(shadow.bytes.data() + (from - shadow.start),
+                                part.data + (from - part.addr), to - from);
+                }
+            }
+        }
+    }
+    return written;
+}
+
+void BufferCache::PeekGpuData(VAddr addr, u64 size, u8* out) {
+    std::memcpy(out, reinterpret_cast<const void*>(addr), size);
+    const auto* arena = GetArena(addr >> block_shift, (addr + size - 1) >> block_shift);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    u64 total = 0;
+    gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
+        copies.push_back({start - arena->cpu_addr, total, end - start});
+        total += Common::AlignUp(end - start, 64);
+    });
+    if (total == 0) {
+        return;
+    }
+    const auto download = staging_pool.Request(total, VideoCore::MemoryType::HostCached);
+    for (auto& copy : copies) {
+        copy.dstOffset += download.offset;
+    }
+    runtime.CopyBuffer(arena, download.buffer, copies);
+    scheduler.Finish();
+    download.buffer->Invalidate(download.offset, download.size);
+    for (const auto& copy : copies) {
+        std::memcpy(out + (arena->cpu_addr + copy.srcOffset - addr),
+                    download.mapped + (copy.dstOffset - download.offset), copy.size);
+    }
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;

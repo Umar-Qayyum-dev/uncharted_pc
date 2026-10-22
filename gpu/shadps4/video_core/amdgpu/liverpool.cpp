@@ -27,6 +27,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 
 namespace AmdGpu {
 
@@ -312,6 +313,11 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const char* env = std::getenv("BB_ASYNC_FENCES");
         return env && env[0] == '1';
     }();
+    // Scalar copy read backs (vk_shader_hle.cpp) go into guest memory before the fence.
+    Common::UniqueFunction<void> signal{[eop] { SignalEop(eop); }};
+    if (Vulkan::DeferGuestFence(rasterizer, signal)) {
+        return;
+    }
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {

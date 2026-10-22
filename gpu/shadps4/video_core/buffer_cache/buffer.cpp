@@ -274,6 +274,7 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
 
     if (offset + size > this->size_bytes) {
         // The buffer would overflow, save the amount of used watches and reset the state.
+        ++laps;
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;

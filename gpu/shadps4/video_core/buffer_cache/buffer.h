@@ -147,6 +147,11 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
+    /// bbport: times the buffer wrapped around (regions of an earlier lap may be reused).
+    [[nodiscard]] u64 Laps() const noexcept {
+        return laps;
+    }
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -181,6 +186,7 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 laps{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

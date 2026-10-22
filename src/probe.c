@@ -10,6 +10,9 @@
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #include "cpu_patch.h"
+#ifdef _WIN32
+#include "red_zone.h"
+#endif
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
@@ -209,6 +212,8 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     HMODULE module=NULL;
     char name[MAX_PATH]="?";
     if (image && address-(uintptr_t)image<0x20000000) { snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image); return; }
+    uint64_t site;
+    if (red_zone_site(address,&site)) { snprintf(out,size,"red-zone thunk for guest offset %#" PRIx64,site); return; }
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)address,&module) && module) {
         GetModuleFileNameA(module,name,sizeof(name));
         const char *base=strrchr(name,'\\');
@@ -324,7 +329,10 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) {
+            red_zone_fault_handled(info->ContextRecord->Rip);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
              * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
@@ -1097,6 +1105,16 @@ int main(int argc, char **argv) {
             if (segments[s].flags&1) { code[n][0]=segments[s].address; code[n][1]=segments[s].size; ++n; }
         cpu_patch_image(image, size, (const uint64_t (*)[2])code, n);
     }
+#ifdef _WIN32
+    /* Last code patch: Windows exception frames and the red zone of leaf functions (red_zone.c). */
+    {
+        RedZoneSegment *loaded=calloc(ns ? ns : 1,sizeof(*loaded));
+        if (!loaded) fail("allocation failed");
+        for (uint64_t s=0;s<ns;++s) loaded[s]=(RedZoneSegment){segments[s].address,segments[s].size,segments[s].flags};
+        red_zone_patch(image, size, loaded, ns);
+        free(loaded);
+    }
+#endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

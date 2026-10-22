@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -16,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/button_prompts.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -69,6 +71,29 @@ void TextureCache::ProcessDownloadImages() {
         DownloadImageMemory(image_id, true);
     }
     download_images.clear();
+    // bbport: copied with the work recorded so far and written to guest memory once the GPU
+    // has done it, without waiting here: the game reads them on the CPU a frame or more later.
+    for (const ImageId image_id : tiny_download_images) {
+        DownloadImageMemory(image_id, false);
+    }
+    tiny_download_images.clear();
+}
+
+// bbport: U2's aiming autofocus renders the depth under the crosshair down to a 1x1 R32F image
+// that the game reads on the CPU to set the depth of field. Render targets are not copied back
+// to guest memory (BB_READBACK_LINEAR=1 does it for linear images, waiting for the GPU at each
+// fence), so the CPU read a stale value: the focus sat at ~2 m and everything behind Drake was
+// blurred while aiming. Images of at most 4x4 pixels (1x1 of any tiling, else linear) the GPU
+// writes are now copied back after each use without waiting. BB_TINY_READBACK=0: off.
+bool TextureCache::TinyReadback(const Image& image) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_TINY_READBACK");
+        return !(env && env[0] == '0');
+    }();
+    const auto& size = image.info.size;
+    return enabled && image.info.guest_address != 0 && size.depth == 1 &&
+           size.width * size.height <= 16 &&
+           (!image.info.props.is_tiled || (size.width == 1 && size.height == 1));
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
@@ -675,6 +700,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
+        } else if (TinyReadback(image)) {
+            std::unique_lock lk{download_images_mutex};
+            tiny_download_images.emplace(image_id);
         }
     }
     if (refresh) {
@@ -702,6 +730,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
+    } else if (TinyReadback(image)) {
+        std::unique_lock lk{download_images_mutex};
+        tiny_download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -759,6 +790,99 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     }
 
     return image.FindView(desc.view_info, false);
+}
+
+namespace {
+
+// bbport: the guest ranges of the pictures ReplaceButtonPrompts knows, reloaded when the player
+// switches between controller and keyboard (UpdateButtonPrompts).
+std::mutex prompt_mutex;
+std::vector<std::pair<VAddr, u32>> prompt_ranges;
+
+/// bbport: a button icon sheet or big prompt picture the game uploaded gets keyboard and mouse
+/// pictures over its PlayStation buttons (button_prompts.cpp), recorded after the game's own
+/// upload.
+void ReplaceButtonPrompts(Vulkan::Runtime& runtime, Image& image) {
+    const auto& info = image.info;
+    ButtonPrompts::Format format;
+    switch (info.pixel_format) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+        format = ButtonPrompts::Format::Rgba8;
+        break;
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+    case vk::Format::eBc1RgbUnormBlock:
+    case vk::Format::eBc1RgbSrgbBlock:
+        format = ButtonPrompts::Format::Bc1;
+        break;
+    default:
+        return;
+    }
+    const auto& mip = info.mips_layout[0];
+    if (!info.guest_address || !mip.size ||
+        !ButtonPrompts::Candidate(info.size.width, info.size.height, format)) {
+        return;
+    }
+    const u8* guest = std::bit_cast<const u8*>(info.guest_address) + mip.offset;
+    const auto* patches = ButtonPrompts::Find(XXH3_64bits(guest, mip.size), info.size.width,
+                                              info.size.height, info.resources.levels, format);
+    if (!patches || patches->empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{prompt_mutex};
+        const std::pair<VAddr, u32> range{info.guest_address, info.guest_size};
+        if (std::ranges::find(prompt_ranges, range) == prompt_ranges.end()) {
+            prompt_ranges.push_back(range);
+        }
+    }
+    if (!ButtonPrompts::KeyboardShown()) {
+        return; // the game's own picture, just uploaded
+    }
+    u64 total = 0;
+    for (const auto& patch : *patches) {
+        total += Common::AlignUp(patch.data.size(), 16);
+    }
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
+    boost::container::small_vector<vk::BufferImageCopy, 32> copies;
+    u64 offset = 0;
+    for (const auto& patch : *patches) {
+        std::memcpy(staging.mapped + offset, patch.data.data(), patch.data.size());
+        copies.push_back({
+            .bufferOffset = staging.offset + offset,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = patch.mip,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {s32(patch.x), s32(patch.y), 0},
+            .imageExtent = {patch.width, patch.height, 1},
+        });
+        offset += Common::AlignUp(patch.data.size(), 16);
+    }
+    staging.Flush();
+    runtime.UploadImage(&image, staging.buffer, copies);
+}
+
+} // namespace
+
+void TextureCache::UpdateButtonPrompts() {
+    const u32 switches = ButtonPrompts::Switches();
+    if (switches == button_prompt_switches) {
+        return;
+    }
+    button_prompt_switches = switches;
+    std::vector<std::pair<VAddr, u32>> ranges;
+    {
+        std::scoped_lock lock{prompt_mutex};
+        ranges = prompt_ranges;
+    }
+    // Uploaded again at their next use, as the game's pictures or with the keys.
+    for (const auto& [address, size] : ranges) {
+        InvalidateMemory(address, size);
+    }
 }
 
 void TextureCache::RefreshImage(Image& image) {
@@ -846,6 +970,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    ReplaceButtonPrompts(runtime, image);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1199,6 +1324,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
         }
+        tiny_download_images.erase(image_id);
     }
 
     // Reclaim image and any image views it references.

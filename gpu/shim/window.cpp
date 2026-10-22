@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 namespace {
 // bbport: mouse input for runtime_pad.c (keyboard and mouse controls). The window thread adds
@@ -161,6 +162,10 @@ bool WindowSDL::PollEvents() {
             }
             UpdateTextTitle();
             continue;
+        }
+        // BB_TEXTURE_DUMP=1: F10 saves the textures of the next frame (user/texture_dump).
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat) {
+            Vulkan::FrameCapture::ArmTextureDump();
         }
         // The controller finishes the text dialog too: Cross (A) accepts, Circle (B) cancels.
         if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&

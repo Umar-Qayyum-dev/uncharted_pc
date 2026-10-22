@@ -102,8 +102,11 @@ static SDL_Gamepad *current_gamepad(void) {
 #define MOUSE_DEGREES_PER_PIXEL 0.15f
 
 /* ---- bindings (input.ini) ---------------------------------------------------------------- */
-enum { BIND_KEY=1, BIND_MOUSE, BIND_WHEEL };
-typedef struct { uint8_t kind; int16_t code; } Bind;
+/* BIND_KEY: a physical key (SDL scancode, US position). BIND_LAYOUT: a character key the player
+ * chose, found in the current keyboard layout (SDL keycode), so "Z" is the key labelled Z on an
+ * AZERTY keyboard too. The default letters stay positions: WASD is ZQSD on AZERTY. */
+enum { BIND_KEY=1, BIND_MOUSE, BIND_WHEEL, BIND_LAYOUT };
+typedef struct { uint8_t kind; int32_t code; } Bind;
 typedef struct { const char *name; uint32_t ps; const char *keys; const char *pad; } Action;
 enum { A_LS_UP=16, A_LS_DOWN, A_LS_LEFT, A_LS_RIGHT, A_RS_UP, A_RS_DOWN, A_RS_LEFT, A_RS_RIGHT, ACTIONS };
 static const Action actions[ACTIONS]={
@@ -126,15 +129,30 @@ static struct {
     float mouse_sensitivity;
 } input;
 
-static Bind parse_bind(const char *name) {
+/* Whether `name` is one of the keys in `defaults` ("Escape|Return"). */
+static int default_key(const char *name, const char *defaults) {
+    const size_t length=strlen(name);
+    for (const char *d=defaults; d && *d; ) {
+        const char *end=strchr(d,'|');
+        const size_t n=end ? (size_t)(end-d) : strlen(d);
+        if (n==length && !SDL_strncasecmp(d,name,n)) return 1;
+        d=end ? end+1 : NULL;
+    }
+    return 0;
+}
+static Bind parse_bind(const char *name, const char *defaults) {
     static const struct { const char *name; uint8_t kind; int16_t code; } mouse[]={
         {"Mouse Left",BIND_MOUSE,1}, {"Mouse Right",BIND_MOUSE,2}, {"Mouse Middle",BIND_MOUSE,4},
         {"Mouse 4",BIND_MOUSE,8}, {"Mouse 5",BIND_MOUSE,16}, {"Wheel Up",BIND_WHEEL,1}, {"Wheel Down",BIND_WHEEL,-1},
     };
     for (size_t i=0;i<sizeof(mouse)/sizeof(*mouse);++i)
         if (!SDL_strcasecmp(name,mouse[i].name)) return (Bind){mouse[i].kind,mouse[i].code};
+    if (name[0]>' ' && name[0]<127 && !name[1] && !default_key(name,defaults)) {
+        const SDL_Keycode key=SDL_GetKeyFromName(name);
+        if (key!=SDLK_UNKNOWN) return (Bind){BIND_LAYOUT,(int32_t)key};
+    }
     const SDL_Scancode code=SDL_GetScancodeFromName(name);
-    return code==SDL_SCANCODE_UNKNOWN ? (Bind){0,0} : (Bind){BIND_KEY,(int16_t)code};
+    return code==SDL_SCANCODE_UNKNOWN ? (Bind){0,0} : (Bind){BIND_KEY,(int32_t)code};
 }
 static void set_keys(int action, const char *value) {
     char text[128];
@@ -142,8 +160,8 @@ static void set_keys(int action, const char *value) {
     input.keys[action][0]=input.keys[action][1]=(Bind){0,0};
     char *second=strchr(text,'|');
     if (second) *second++=0;
-    if (*text) input.keys[action][0]=parse_bind(text);
-    if (second && *second) input.keys[action][1]=parse_bind(second);
+    if (*text) input.keys[action][0]=parse_bind(text,actions[action].keys);
+    if (second && *second) input.keys[action][1]=parse_bind(second,actions[action].keys);
 }
 static int parse_pad(const char *value) {
     if (!SDL_strcasecmp(value,"lefttrigger")) return PAD_TRIGGER_LEFT;
@@ -202,9 +220,24 @@ static uint8_t mouse_axis(float rate) {
 static int bind_down(const Bind *b, const bool *k, uint32_t mouse, uint64_t now) {
     switch (b->kind) {
     case BIND_KEY: return k && k[b->code];
+    case BIND_LAYOUT: {
+        const SDL_Scancode code=k ? SDL_GetScancodeFromKey((SDL_Keycode)b->code,NULL) : SDL_SCANCODE_UNKNOWN;
+        return code!=SDL_SCANCODE_UNKNOWN && k[code];
+    }
     case BIND_MOUSE: return (mouse & (uint32_t)b->code)!=0;
     case BIND_WHEEL: return now<wheel_until_us[b->code>0 ? 0 : 1];
     default: return 0;
+    }
+}
+/* Once the keyboard is up: where the layout put each character key the player chose. */
+static void log_layout_keys(void) {
+    for (int a=0;a<ACTIONS;++a) for (int i=0;i<2;++i) {
+        const Bind *b=&input.keys[a][i];
+        if (b->kind!=BIND_LAYOUT) continue;
+        const SDL_Scancode code=SDL_GetScancodeFromKey((SDL_Keycode)b->code,NULL);
+        printf("Runtime: key.%s %s: the key labelled so in this keyboard layout (US position %s)\n",
+               actions[a].name,SDL_GetKeyName((SDL_Keycode)b->code),
+               code==SDL_SCANCODE_UNKNOWN ? "none" : SDL_GetScancodeName(code));
     }
 }
 static int action_down(int a, const bool *k, uint32_t mouse, uint64_t now) {
@@ -542,6 +575,8 @@ static void sample_host(PadData *d) {
     if (wheel>0) wheel_until_us[0]=now+80000;
     if (wheel<0) wheel_until_us[1]=now+80000;
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    static int layout_logged;
+    if (k && !layout_logged) { layout_logged=1; log_layout_keys(); }
     if (g) {
         for (int a=0;a<16;++a) {
             const int b=input.pad[a];
@@ -571,6 +606,18 @@ static void sample_host(PadData *d) {
                 }
             }
         }
+    }
+    /* The device used last picks the button prompts: the game's PlayStation buttons or pictures
+     * of the bound keys (bbgpu_prompts_controller). A stick counts past half way, the mouse when
+     * it moves more than a few pixels. */
+    const int pad_used=g && (d->buttons || d->l2>60 || d->r2>60 || abs(d->left_x-128)>64 ||
+                             abs(d->left_y-128)>64 || abs(d->right_x-128)>64 || abs(d->right_y-128)>64);
+    int keys_used=mouse || wheel || (captured && SDL_fabsf(mdx)+SDL_fabsf(mdy)>3.0f);
+    for (int a=0;a<ACTIONS && !keys_used;++a) keys_used=action_down(a,k,mouse,now);
+    static int prompts_controller=-1;
+    if (pad_used!=keys_used && pad_used!=prompts_controller) {
+        prompts_controller=pad_used;
+        bbgpu_prompts_controller(pad_used);
     }
     /* Keyboard and mouse, together with the controller. */
     for (int a=0;a<16;++a) if (action_down(a,k,mouse,now)) d->buttons|=actions[a].ps;

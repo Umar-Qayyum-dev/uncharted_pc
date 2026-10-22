@@ -33,6 +33,7 @@
 #include "core/signals.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/button_prompts.h"
 
 extern "C" {
 // runtime_memory.c
@@ -379,6 +380,10 @@ u32 ConsumeGameOnlyScreenshotRequests() { return 0; }
 u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
 ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 } // namespace VideoCore
+
+extern "C" void bbgpu_prompts_controller(int controller) {
+    VideoCore::ButtonPrompts::SetController(controller != 0);
+}
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -10,6 +12,17 @@
 namespace Shader {
 struct Profile;
 void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_info);
+
+/// bbport: SharedMemoryBarrierPass also covers workgroups larger than one 64-lane wave.
+/// BB_WAVE_LDS_BARRIERS=0: only workgroups of exactly one wave, as before (part of the shader
+/// cache version, so a change rebuilds the cache).
+inline bool WaveLdsBarriers() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_WAVE_LDS_BARRIERS");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
 } // namespace Shader
 
 namespace Shader::Optimization {

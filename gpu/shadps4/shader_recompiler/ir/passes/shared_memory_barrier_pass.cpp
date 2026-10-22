@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <unordered_set>
+#include <vector>
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 
 namespace Shader::Optimization {
 
@@ -112,6 +115,66 @@ static NodeSet FindDivergentLoops(const IR::AbstractSyntaxList& syntax_list) {
 
 static constexpr u32 GcnSubgroupSize = 64;
 
+// bbport: workgroups larger than one wave. Their GCN code has s_barrier wherever more than one
+// wave shares data, and none where only lanes of the first wave do: the last steps of tree
+// reductions, `if (lane < 32) { lds[lane] += lds[lane + 32]; }` and so on. A barrier is added
+// where such a step rejoins: after a top-level if (not inside any other if or loop) whose
+// condition depends on the local invocation id and whose body writes shared memory. All
+// invocations reach that point. Barriers deeper in the code (the 64-thread rules above) were
+// tried and broke other shaders (U3's sun shadows: barriers inside branches whose divergence
+// comes from data, which IsDivergent does not see). Shaders that return early from inside a
+// branch get none.
+static void EmitWaveStepBarriers(IR::Program& program) {
+    using Type = IR::AbstractSyntaxNode::Type;
+    std::vector<IR::Block*> merges;
+    u32 nesting{};
+    IR::Block* candidate{};
+    bool writes{};
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case Type::If:
+            if (nesting == 0) {
+                candidate = IsDivergent(node.data.if_node.cond) ? node.data.if_node.merge : nullptr;
+                writes = false;
+            }
+            ++nesting;
+            break;
+        case Type::EndIf:
+            --nesting;
+            if (nesting == 0 && candidate && writes) {
+                merges.push_back(node.data.end_if.merge);
+            }
+            break;
+        case Type::Loop:
+            if (nesting == 0) {
+                candidate = nullptr;
+            }
+            ++nesting;
+            break;
+        case Type::Repeat:
+            --nesting;
+            break;
+        case Type::Return:
+        case Type::Unreachable:
+            if (nesting != 0) {
+                return;
+            }
+            break;
+        case Type::Block:
+            if (nesting != 0 && candidate && !writes) {
+                writes = std::ranges::any_of(node.data.block->Instructions(),
+                                             [](const IR::Inst& inst) { return IsWriteShared(inst); });
+            }
+            break;
+        case Type::Break:
+            break;
+        }
+    }
+    for (IR::Block* merge : merges) {
+        EmitBarrierAtBlockStart(merge);
+    }
+}
+
 void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_info,
                              const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
@@ -122,9 +185,19 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     const u32 threadgroup_size =
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
-    // subgroup.
-    if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
-        !profile.needs_lds_barriers) {
+    // subgroup, or (bbport) in larger workgroups where only the first wave shares data
+    // (EmitWaveStepBarriers: U3's exposure sums lost partial sums on 32-lane subgroups, the
+    // measured brightness came out too low and the exposure went to its maximum).
+    if (shared_memory_size == 0 || !profile.needs_lds_barriers) {
+        return;
+    }
+    if (threadgroup_size > GcnSubgroupSize) {
+        if (WaveLdsBarriers()) {
+            EmitWaveStepBarriers(program);
+        }
+        return;
+    }
+    if (threadgroup_size != GcnSubgroupSize) {
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;

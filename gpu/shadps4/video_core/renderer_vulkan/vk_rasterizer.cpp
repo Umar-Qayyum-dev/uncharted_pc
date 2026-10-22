@@ -1978,7 +1978,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         }
     }
 
-    if (needs_barrier) {
+    if (needs_barrier || runtime.TrackerFull()) {
         runtime.FlushBarriers();
     }
 

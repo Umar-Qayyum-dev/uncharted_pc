@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+#include "bbport_toggles.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -97,6 +99,19 @@ public:
 
     void FlushBarriers();
 
+    /// bbport: the barrier tracker holds many ranges. Lookups and inserts slow down as it
+    /// grows (U2's museum: 2 ms a frame with a barrier before most dispatches, 9 ms with ~70
+    /// barriers a frame), so a dispatch, outside any render pass, flushes the barriers then
+    /// even when it needs none. BB_TRACKER_CAP=N: ranges inserted since the last flush (64).
+    /// Toggle bit TrackerCap: no such flushes.
+    [[nodiscard]] bool TrackerFull() const {
+        static const u32 cap = [] {
+            const char* env = std::getenv("BB_TRACKER_CAP");
+            return env ? u32(std::strtoul(env, nullptr, 10)) : 64u;
+        }();
+        return cap && inserts_since_flush >= cap && !BbToggle::Disabled(BbToggle::TrackerCap);
+    }
+
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
     void SetImageAccessHook(void (*hook)(void*), void* context) {
@@ -117,6 +132,7 @@ private:
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
     BarrierTracker barrier_tracker;
+    u32 inserts_since_flush = 0; ///< bbport: ranges inserted since the tracker was cleared
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
     // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a

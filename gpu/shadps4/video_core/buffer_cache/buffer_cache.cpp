@@ -337,6 +337,7 @@ u32 LastGpuUse(VAddr address, u64 size) {
 } // namespace
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    ForgetStreamCopies();
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         // bbport: a guest write to a page holding GPU data read that data back first, which
         // waits for the whole GPU queue (U3's Cartagena square: ~70 times a second, 5-20 ms each,
@@ -911,6 +912,22 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             ++region.stream_count;
             region.stream_bytes += size;
         }
+        // bbport: the same range streamed earlier into this command buffer, with nothing known
+        // to have written guest memory since: that copy is still there (the stream buffer keeps
+        // a region until the GPU has passed its tick, and this use has the same tick).
+        const bool memo = !BbToggle::Disabled(BbToggle::StreamCopyMemo);
+        const u64 tick = scheduler.CurrentTick();
+        const u64 epoch = stream_memo_epoch.load(std::memory_order_relaxed);
+        auto& entry = stream_memo[((device_addr >> 4) ^ (device_addr >> 12) ^ size) & 255];
+        if (memo && entry.address == device_addr && entry.size == size && entry.tick == tick &&
+            entry.lap == stream_buffer.Laps() && entry.epoch == epoch) {
+            return {&stream_buffer, entry.offset};
+        }
+        const auto remember = [&](u64 offset) {
+            if (memo) {
+                entry = {device_addr, size, offset, tick, stream_buffer.Laps(), epoch};
+            }
+        };
         // bbport: the guest data is copied on a copy thread, started now; submission and
         // guest-visible fences wait for it (Scheduler::WaitHostCopies).
         if (!stream_buffer.mapped_data.empty() &&
@@ -924,12 +941,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     .size = size,
                     .extra = reinterpret_cast<u64>(static_cast<Buffer*>(&stream_buffer)),
                 });
+                remember(*offset);
                 return {&stream_buffer, *offset};
             }
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        remember(offset);
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;

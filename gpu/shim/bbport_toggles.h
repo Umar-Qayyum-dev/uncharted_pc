@@ -40,6 +40,7 @@ enum : std::uint64_t {
     ParallelCopies = 131072,
     AsyncFences = 262144,
     PoolSmallCopies = 524288,
+    StreamCopyMemo = 1ull << 31, ///< a read-only range streamed in this command buffer is reused
     RecordPrefetch = 1ull << 32,
     TextureViewMemo = 1ull << 33,
     TextureBindHelper = 1ull << 34,

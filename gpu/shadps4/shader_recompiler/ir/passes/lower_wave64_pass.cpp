@@ -128,7 +128,11 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         return;
     }
 
-    const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
+    // bbport: after the out-of-range sink of SharedMemoryRangePass, if it added one.
+    const u32 scratch_base =
+        Common::AlignUp(runtime_info.hw.cs.shared_memory_size +
+                            program.info.shared_memory_scratch_size,
+                        sizeof(u64));
     const u32 scratch_size =
         (Common::AlignUp(num_threads, 64) / profile.subgroup_size) * sizeof(u32);
     program.info.shared_memory_scratch_size =

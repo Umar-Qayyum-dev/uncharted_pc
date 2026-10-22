@@ -6,8 +6,8 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
-#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "video_core/cache_storage.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -15,10 +15,12 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // bbport: 10 = ReadConst windows of ReadConstWindowDwords() (its value is part of the version, so
-// a different BB_READCONST_WINDOW_DWORDS rebuilds the cache); 11 = SharedMemoryBarrierPass for
-// workgroups larger than a wave (WaveLdsBarriers: bit 7, so BB_WAVE_LDS_BARRIERS=0 rebuilds too).
+// a different BB_READCONST_WINDOW_DWORDS rebuilds the cache).
+// 12 = SharedMemoryBarrierPass for workgroups larger than a wave, top-level steps only
+// (WaveLdsBarriers, bit 7). 13 = SharedMemoryRangePass (LdsOutOfRange, bit 6).
 static u32 ShaderBinaryVersion() {
-    return 11u | (u32(Shader::WaveLdsBarriers()) << 7) | (Shader::ReadConstWindowDwords() << 8);
+    return 13u | (u32(Shader::LdsOutOfRange()) << 6) | (u32(Shader::WaveLdsBarriers()) << 7) |
+           (Shader::ReadConstWindowDwords() << 8);
 }
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)

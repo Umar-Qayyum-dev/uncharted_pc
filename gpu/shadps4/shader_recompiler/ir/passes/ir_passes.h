@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -10,6 +12,17 @@
 namespace Shader {
 struct Profile;
 void InjectClipDistanceAttributes(IR::Program& program, RuntimeInfo& runtime_info);
+
+/// bbport: shared memory accesses beyond the workgroup's allocation behave as on GCN (reads 0,
+/// writes dropped). BB_LDS_RANGE=0: unchecked, as before (part of the shader cache version, so
+/// a change rebuilds the cache).
+inline bool LdsOutOfRange() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_LDS_RANGE");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
 } // namespace Shader
 
 namespace Shader::Optimization {
@@ -44,5 +57,6 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile);
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile);
+void SharedMemoryRangePass(IR::Program& program, const RuntimeInfo& runtime_info);
 
 } // namespace Shader::Optimization

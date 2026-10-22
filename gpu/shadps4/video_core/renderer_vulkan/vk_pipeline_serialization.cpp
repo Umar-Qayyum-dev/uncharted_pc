@@ -6,6 +6,7 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -13,7 +14,11 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // bbport: addr64 buffer loads (ReadConst windows)
+// bbport: 9 = addr64 buffer loads (ReadConst windows); 11 = SharedMemoryRangePass
+// (LdsOutOfRange: bit 6, so BB_LDS_RANGE=0 rebuilds too).
+static u32 ShaderBinaryVersion() {
+    return 11u | (u32(Shader::LdsOutOfRange()) << 6);
+}
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization
@@ -70,7 +75,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(Serialization::ShaderBinaryVersion());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -105,7 +110,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != Serialization::ShaderBinaryVersion()) {
         return false;
     }
 

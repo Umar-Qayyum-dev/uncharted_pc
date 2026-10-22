@@ -2805,6 +2805,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             std::fflush(stdout);
         }
     }
+    // bbport: the bytes of a written buffer tracked for barriers. Interleaved outputs (U2's
+    // skinning shader: one V# per vertex attribute at +0/+12/+20, all with the same stride and
+    // record count) each claim stride * records bytes from their own base, so the later
+    // attributes reach up to a stride past the vertices, into the next mesh's output: each of
+    // ~1200 dispatches a frame got a full barrier against the one before. Such a view only
+    // writes its attribute inside each record, so its range ends where the records of the
+    // lowest view end. Toggle bit InterleavedWriteRanges: the full range as before.
+    const auto tracked_size = [&](u32 index, const auto& v, u64 size) -> u64 {
+        if (!stage.buffers[index].is_written || v.GetStride() == 0 ||
+            BbToggle::Disabled(BbToggle::InterleavedWriteRanges)) {
+            return size;
+        }
+        VAddr lowest = v.base_address;
+        for (u32 i = 0; i < stage.buffers.size(); ++i) {
+            const auto& other = stage.buffers[i];
+            if (i == index || other.IsSpecial() || !other.is_written) {
+                continue;
+            }
+            const auto o = prepared ? prepared->buffer_sharps[i] : other.GetSharp(stage);
+            if (o.GetStride() == v.GetStride() && o.num_records == v.num_records &&
+                o.base_address < lowest && v.base_address - o.base_address < v.GetStride()) {
+                lowest = o.base_address;
+            }
+        }
+        const u64 shift = v.base_address - lowest;
+        return shift < size ? size - shift : size;
+    };
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
@@ -2939,7 +2966,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
-                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                const u64 tracked = tracked_size(buffer_index, vsharp, size);
+                bound_buffers.emplace_back(buffer, offset, tracked, desc.is_written);
                 if (g_gpu_checkpoints && num_checkpoint_buffers < std::size(checkpoint_buffers)) {
                     checkpoint_buffers[num_checkpoint_buffers++] = {
                         vsharp.base_address, static_cast<u32>(size), desc.is_written};
@@ -2948,7 +2976,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, tracked, desc.is_written);
                 if (const VAddr watch = WatchedGpuWrite();
                     watch && desc.is_written && vsharp.base_address < watch + 0x1000 &&
                     watch < vsharp.base_address + size) {

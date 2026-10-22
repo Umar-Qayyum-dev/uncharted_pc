@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/button_prompts.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
@@ -791,6 +792,99 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+namespace {
+
+// bbport: the guest ranges of the pictures ReplaceButtonPrompts knows, reloaded when the player
+// switches between controller and keyboard (UpdateButtonPrompts).
+std::mutex prompt_mutex;
+std::vector<std::pair<VAddr, u32>> prompt_ranges;
+
+/// bbport: a button icon sheet or big prompt picture the game uploaded gets keyboard and mouse
+/// pictures over its PlayStation buttons (button_prompts.cpp), recorded after the game's own
+/// upload.
+void ReplaceButtonPrompts(Vulkan::Runtime& runtime, Image& image) {
+    const auto& info = image.info;
+    ButtonPrompts::Format format;
+    switch (info.pixel_format) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+        format = ButtonPrompts::Format::Rgba8;
+        break;
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+    case vk::Format::eBc1RgbUnormBlock:
+    case vk::Format::eBc1RgbSrgbBlock:
+        format = ButtonPrompts::Format::Bc1;
+        break;
+    default:
+        return;
+    }
+    const auto& mip = info.mips_layout[0];
+    if (!info.guest_address || !mip.size ||
+        !ButtonPrompts::Candidate(info.size.width, info.size.height, format)) {
+        return;
+    }
+    const u8* guest = std::bit_cast<const u8*>(info.guest_address) + mip.offset;
+    const auto* patches = ButtonPrompts::Find(XXH3_64bits(guest, mip.size), info.size.width,
+                                              info.size.height, info.resources.levels, format);
+    if (!patches || patches->empty()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{prompt_mutex};
+        const std::pair<VAddr, u32> range{info.guest_address, info.guest_size};
+        if (std::ranges::find(prompt_ranges, range) == prompt_ranges.end()) {
+            prompt_ranges.push_back(range);
+        }
+    }
+    if (!ButtonPrompts::KeyboardShown()) {
+        return; // the game's own picture, just uploaded
+    }
+    u64 total = 0;
+    for (const auto& patch : *patches) {
+        total += Common::AlignUp(patch.data.size(), 16);
+    }
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
+    boost::container::small_vector<vk::BufferImageCopy, 32> copies;
+    u64 offset = 0;
+    for (const auto& patch : *patches) {
+        std::memcpy(staging.mapped + offset, patch.data.data(), patch.data.size());
+        copies.push_back({
+            .bufferOffset = staging.offset + offset,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = patch.mip,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {s32(patch.x), s32(patch.y), 0},
+            .imageExtent = {patch.width, patch.height, 1},
+        });
+        offset += Common::AlignUp(patch.data.size(), 16);
+    }
+    staging.Flush();
+    runtime.UploadImage(&image, staging.buffer, copies);
+}
+
+} // namespace
+
+void TextureCache::UpdateButtonPrompts() {
+    const u32 switches = ButtonPrompts::Switches();
+    if (switches == button_prompt_switches) {
+        return;
+    }
+    button_prompt_switches = switches;
+    std::vector<std::pair<VAddr, u32>> ranges;
+    {
+        std::scoped_lock lock{prompt_mutex};
+        ranges = prompt_ranges;
+    }
+    // Uploaded again at their next use, as the game's pictures or with the keys.
+    for (const auto& [address, size] : ranges) {
+        InvalidateMemory(address, size);
+    }
+}
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
@@ -876,6 +970,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    ReplaceButtonPrompts(runtime, image);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,

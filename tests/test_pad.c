@@ -5,6 +5,13 @@
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
+void bbgpu_mouse_configure(int look) { (void)look; }
+int bbgpu_mouse_sample(float *dx, float *dy, uint32_t *buttons, int *wheel) {
+    *dx=*dy=0; *buttons=0; *wheel=0;
+    return 0;
+}
+int bbgpu_camera_yaw(float *yaw_degrees, double *age_seconds) { (void)yaw_degrees; (void)age_seconds; return 0; }
+void bbgpu_prompts_controller(int controller) { (void)controller; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

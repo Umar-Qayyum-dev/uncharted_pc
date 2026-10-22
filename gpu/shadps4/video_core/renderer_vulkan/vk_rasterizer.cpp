@@ -2105,6 +2105,7 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
+    texture_cache.UpdateButtonPrompts();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
@@ -2136,8 +2137,17 @@ bool Rasterizer::BindHelperWanted() {
     return false;
 }
 
+bool Rasterizer::DrawsToDisplayForIcons() const {
+    if (!FrameCapture::CollectingIcons()) {
+        return false;
+    }
+    const auto& regs = Regs();
+    return regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address());
+}
+
 bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
     if (pipeline->IsCompute() || !bind_helper.Available() || FrameCapture::Active() ||
+        DrawsToDisplayForIcons() ||
         BbToggle::Disabled(BbToggle::TextureBindHelper) ||
         BbToggle::Disabled(BbToggle::TextureBindingMemo) ||
         BbToggle::Disabled(BbToggle::UpdateImageFastPath)) {
@@ -3078,8 +3088,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             std::fflush(stdout);
         }
     }
+    // BB_ICON_COLLECT=1: the HUD and prompt pictures, drawn straight into a display buffer.
+    const bool collect_icons =
+        !on_helper && stage.sw_stage != Shader::SwStage::Compute && DrawsToDisplayForIcons();
     TextureSet* set_slot = nullptr;
-    if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
+    if (!on_helper && !collect_icons &&
+        BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {
         // Descriptor writes: one per image (no mip arrays in a memoized set).
         for (u32 i = 0; i < stage.images.size(); ++i) {
             auto& set_write = set_writes[write_index++];
@@ -3260,6 +3274,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
+            if (FrameCapture::Active() && !is_storage) {
+                FrameCapture::DumpTexture(runtime, image);
+            }
+            if (collect_icons && !is_storage) {
+                FrameCapture::CollectIcon(runtime, image);
+            }
             const auto binding = image.binding;
 
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:

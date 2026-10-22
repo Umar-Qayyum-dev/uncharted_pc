@@ -292,6 +292,8 @@ private:
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
     /// no storage writes that invalidate cached images).
     bool HelperEligible(const Pipeline* pipeline) const;
+    /// The current draw writes a display buffer and FrameCapture collects icons.
+    bool DrawsToDisplayForIcons() const;
     /// Whether every texture of `stage` takes the memoized path without refreshing, creating or
     /// redirecting anything that records commands or touches the buffer cache.
     bool TexturesBindableOnHelper(const Shader::Info& stage, const PreparedStage* prepared);

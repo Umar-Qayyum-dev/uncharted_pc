@@ -112,6 +112,10 @@ public:
     /// overlapping it is dirty, not only one starting at the address (copies moving textures).
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_range = false);
 
+    /// bbport: after the player switched between controller and keyboard, the button prompt
+    /// pictures are uploaded again (button_prompts.h). GPU thread, once per submission.
+    void UpdateButtonPrompts();
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -452,6 +456,7 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

@@ -3527,9 +3527,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                     static_cast<unsigned long long>(texture_set_hits),
                     static_cast<unsigned long long>(texture_set_misses));
         std::printf("  texture set misses: other key %llu, generation %llu, image check %llu, "
-                    "other %llu\n",
+                    "other %llu; reused after a generation change %llu\n",
                     (unsigned long long)texture_set_why[0], (unsigned long long)texture_set_why[1],
-                    (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3]);
+                    (unsigned long long)texture_set_why[2], (unsigned long long)texture_set_why[3],
+                    (unsigned long long)texture_set_revalidated);
         std::printf("  scene proxies sampled directly: %llu bindings\n",
                     static_cast<unsigned long long>(proxy_samples));
         proxy_samples = 0;

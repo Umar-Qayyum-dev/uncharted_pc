@@ -36,6 +36,8 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'uncharted-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 NAME = 'Uncharted'
 AUTHOR = 'SuperMedo'
+# This fork's credit line (home screen and About).
+FORK_CREDIT = 'Fork of SuperMedo\'s port  ·  patches and launcher by Umar-Qayyum-dev'
 # This build; GitHub release tags are v<VERSION> (their digits are compared).
 VERSION = '0.3.6'
 RELEASES_API = 'https://api.github.com/repos/Supermedo/uncharted_pc/releases/latest'
@@ -1005,7 +1007,7 @@ class Launcher:
         # The collection's heading and the port's credit, bottom right.
         if self.brand_image:
             c.create_image(w - margin, h - band - px(46), image=self.brand_image, anchor='se')
-        self.shadow_text(w - margin, h - band - px(22), _('Port by {}  ·  version {}').format(AUTHOR, VERSION),
+        self.shadow_text(w - margin, h - band - px(22), '{}  ·  {} {}'.format(FORK_CREDIT, _('version'), VERSION),
                          'se', '#8e8a82', self.font_ui_sm)
 
         # Along the bottom: the window options and the keys.
@@ -1507,7 +1509,7 @@ class Launcher:
                     _('Compiled shaders are kept so the game does not stutter again. Clear the cache only '
                       'when the picture is broken after an update.'))
         self.section(f, _('Updates'))
-        self.note(f, _('This is version {} of the port by {}.').format(VERSION, AUTHOR))
+        self.note(f, _('This is version {} of the port by {}.').format(VERSION, AUTHOR) + '\n' + FORK_CREDIT + '.')
         self.check(f, 'check_updates', _('Look for a new version when the launcher starts'))
         self.action(f, _('Check for updates'),
                     lambda: threading.Thread(target=self.check_update, args=(True,), daemon=True).start())

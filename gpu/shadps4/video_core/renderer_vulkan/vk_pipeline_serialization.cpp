@@ -25,9 +25,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 11u; // bbport: motion shaders hold address stand-ins (10); scalar instructions split EXEC scopes (11)
-static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
-static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
+static constexpr u32 ShaderBinaryVersion = 12u; // bbport: motion shaders hold address stand-ins (10); scalar instructions split EXEC scopes (11); WorkgroupSplit (12)
+static constexpr u32 ShaderMetaVersion = 8u; // bbport: InfoPersistent::cs_split_eligible
+static constexpr u32 PipelineKeyVersion = 6u; // bbport: Info layout (cs_split_eligible)
 /// bbport (BilalReloaded): the cache name of a shader's SPIR-V. Shaders that gained multi-wave
 /// LDS barriers get a new name, so their binaries cached before the fix are not found and only
 /// those shaders recompile.

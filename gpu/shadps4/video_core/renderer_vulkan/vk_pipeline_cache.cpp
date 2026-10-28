@@ -252,6 +252,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
                                   cs_pgm.IsTgidEnabled(2)};
         info.hw.cs.shared_memory_size = cs_pgm.SharedMemSize();
+        info.hw.cs.indirect = sel.indirect_dispatch;
         break;
     }
     default:
@@ -347,6 +348,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             return !instance.IsFragmentShaderBarycentricSupported() &&
                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
         }(),
+        .split_large_workgroups = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
@@ -730,8 +732,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return result;
 }
 
-const ComputePipeline* PipelineCache::GetComputePipeline() {
+const ComputePipeline* PipelineCache::GetComputePipeline(bool indirect) {
     EnsureWarm();
+    sel.indirect_dispatch = indirect;
     if (!RefreshComputeKey()) {
         return nullptr;
     }

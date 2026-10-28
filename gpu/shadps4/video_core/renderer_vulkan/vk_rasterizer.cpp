@@ -2187,7 +2187,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     pipeline->BindResources(set_writes, push_data);
 
     const vk::Pipeline handle = pipeline->Handle();
-    const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    // bbport: workgroups compiled as smaller ones (Shader::WorkgroupSplit): that many times the
+    // workgroups in X.
+    const Shader::HwComputeRuntimeInfo hw_cs = {
+        .workgroup_size = {cs_program.num_thread_x.full, cs_program.num_thread_y.full,
+                           cs_program.num_thread_z.full},
+        .indirect = false,
+    };
+    const u32 workgroup_split = Shader::WorkgroupSplit(cs.cs_split_eligible, hw_cs);
+    const u32 dim_x = cs_program.dim_x * workgroup_split, dim_y = cs_program.dim_y,
+              dim_z = cs_program.dim_z;
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -2235,7 +2244,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipelined) {
         DrainDrawPipe();
     }
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline(true);
     if (!pipeline) {
         return;
     }
